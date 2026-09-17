@@ -79,6 +79,11 @@ than a stable stream of intermediate agent or tool events. Zeron therefore
 emits the completed text result and terminal status only; it does not promise
 streaming tool events, token deltas, or live progress from Aside.
 
+The public result also provides the session id only when the call completes.
+Consequently, in-turn steering is available for a resumed or previously
+persisted Aside session; the first-ever turn cannot be steered through this
+transport and reports that limitation instead of guessing a session.
+
 ## Models and options
 
 Aside does not expose a stable public model-catalog API for this integration.
