@@ -1,6 +1,6 @@
 # Zeron
 
-Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity) locally by default, with optional multi-device sync.
+Control your coding agents (Claude Code, Codex, Cursor, Devin, Grok, Hermes, Pi, Antigravity, Aside) locally by default, with optional multi-device sync.
 
 *English | [简体中文](README.zh-CN.md)*
 
@@ -54,6 +54,19 @@ zeron daemon start
 On macOS: use the desktop release, or build `zeron` from source and run `zeron daemon install` to install the launchd service.
 
 On Windows: extract the portable release ZIP and run `zeron.exe`. Keep `zeron-update.json` beside it for in-app updates. See the [development notes](docs/reference/windows-development.md) for source builds.
+
+## Aside CLI
+
+Aside support is macOS-first and requires Aside Browser on macOS 15 or newer, a signed-in Aside account, the running Aside daemon, and macOS Keychain access. Zeron uses the official CLI's public `aside mcp` interface and does not replace the app, daemon, or credential store.
+
+Install the CLI with the official installer:
+
+```sh
+curl -fsSL https://releases.aside.com/install.sh | bash
+aside --version
+```
+
+The installer normally exposes `~/.local/bin/aside` and stores the CLI app at `~/.aside/cli/Aside CLI.app/Contents/MacOS/aside`. Set `ASIDE_EXECUTABLE` to override resolution when needed. See the [Aside CLI reference](docs/reference/aside-cli.md) for lifecycle support, routing, effort and permission options, remote hosts, and known model limitations.
 
 ---
 

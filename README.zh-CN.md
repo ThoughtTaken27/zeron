@@ -1,6 +1,6 @@
 # Zeron
 
-在本地管理你的编码 agent（Claude Code、Codex、Cursor、Grok、Hermes、Pi、Antigravity），也可以打开多设备同步。
+在本地管理你的编码 agent（Claude Code、Codex、Cursor、Grok、Hermes、Pi、Antigravity、Aside），也可以打开多设备同步。
 
 *[English](README.md) | 简体中文*
 
@@ -48,6 +48,19 @@ zeron daemon start
 如果有引擎正占着数据目录，`zeron login` 和 `zeron logout` 会拒绝改动凭据。桌面应用同样遵守这条边界：profile 要等下次重启才切换。
 
 macOS 上用桌面版发行包，或者从源码构建 `zeron`，再运行 `zeron daemon install` 装上 launchd 服务。
+
+## Aside CLI
+
+Aside 集成以 macOS 为优先，需要 macOS 15 或更高版本的 Aside Browser、已登录的 Aside 账号、正在运行的 Aside daemon，以及 macOS 钥匙串访问。Zeron 使用官方 CLI 的公开 `aside mcp` 接口，不会替代 Aside 应用、daemon 或凭据存储。
+
+使用官方安装器安装 CLI：
+
+```sh
+curl -fsSL https://releases.aside.com/install.sh | bash
+aside --version
+```
+
+安装器通常会提供 `~/.local/bin/aside`，并把 CLI 应用放在 `~/.aside/cli/Aside CLI.app/Contents/MacOS/aside`。需要时可用 `ASIDE_EXECUTABLE` 覆盖路径。关于生命周期支持、路由、effort 和权限选项、远程主机以及模型目录限制，请看 [Aside CLI 参考](docs/reference/aside-cli.md)。
 
 ---
 

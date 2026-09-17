@@ -14,6 +14,35 @@ final class HarnessCatalogTests: XCTestCase {
         XCTAssertEqual(astra?.options.first?.choices.map(\.id), ["default", "fast"])
     }
 
+    func testAsideFallbackMirrorsRustRoutingCatalog() {
+        XCTAssertEqual(HarnessCatalog.label(for: "aside"), "Aside")
+        XCTAssertEqual(HarnessCatalog.models(for: "aside").map(\.id), ["default", "fast"])
+
+        for model in HarnessCatalog.models(for: "aside") {
+            XCTAssertEqual(model.reasoningLevels,
+                           ["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+            XCTAssertEqual(model.options.map(\.id), ["effort", "permission"])
+        }
+
+        let effort = HarnessCatalog.models(for: "aside")[0].options[0]
+        XCTAssertEqual(effort.label, "Thinking Effort")
+        XCTAssertEqual(effort.choices.map(\.id),
+                       ["default", "off", "minimal", "low", "medium", "high",
+                        "xhigh", "max", "ultrabrowse"])
+        XCTAssertEqual(effort.defaultChoice, "default")
+
+        let permission = HarnessCatalog.models(for: "aside")[0].options[1]
+        XCTAssertEqual(permission.choices.map(\.id), ["ask", "guard", "full-access"])
+        XCTAssertEqual(permission.defaultChoice, "guard")
+    }
+
+    func testAsideUsesMonochromeBrandAndOffLabel() {
+        XCTAssertNotEqual(BrandMark.forHarness("aside").pathData,
+                          BrandMark.forHarness("claude-code").pathData)
+        XCTAssertNil(BrandMark.brandTint(for: "aside"))
+        XCTAssertEqual(HarnessCatalog.reasoningLabel("off"), "Off")
+    }
+
     func testDefaultReasoningMatchesDesktopPreference() {
         let astra = HarnessCatalog.defaultModel(for: "codex")
         XCTAssertEqual(HarnessCatalog.defaultReasoning(for: astra), "high")

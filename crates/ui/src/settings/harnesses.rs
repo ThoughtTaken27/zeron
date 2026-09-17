@@ -50,6 +50,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Opencode => "SST's opencode agent (opencode CLI).",
+        HarnessId::Aside => "Aside's macOS-first coding agent (Aside CLI).",
         HarnessId::Antigravity => "Google's Antigravity agent (Antigravity ACP server).",
         HarnessId::Mock => "Scripted test harness.",
     }
@@ -66,6 +67,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
+        HarnessId::Aside => "aside",
         HarnessId::Antigravity => "agy",
         HarnessId::Mock => "mock",
     }
@@ -1108,7 +1110,17 @@ impl Render for HarnessesPage {
 
 #[cfg(test)]
 mod tests {
-    use super::SignInPhase;
+    use super::{SignInPhase, blurb, cli_name};
+    use zeron_proto::HarnessId;
+
+    #[test]
+    fn aside_settings_copy_names_the_cli_and_install_guidance() {
+        assert_eq!(
+            blurb(HarnessId::Aside),
+            "Aside's macOS-first coding agent (Aside CLI)."
+        );
+        assert_eq!(cli_name(HarnessId::Aside), "aside");
+    }
 
     #[test]
     fn antigravity_setup_copy_matches_each_phase() {

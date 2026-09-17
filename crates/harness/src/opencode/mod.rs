@@ -169,6 +169,7 @@ fn variant_candidates(reasoning: Option<ReasoningLevel>) -> Vec<&'static str> {
         return Vec::new();
     };
     match level {
+        ReasoningLevel::Off => Vec::new(),
         ReasoningLevel::Minimal => vec!["minimal", "low"],
         ReasoningLevel::Low => vec!["low", "minimal"],
         ReasoningLevel::Medium => vec!["medium"],

@@ -23,6 +23,8 @@ pub enum HarnessId {
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
+    /// Aside's macOS-first coding agent, driven through its native CLI.
+    Aside,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -30,6 +32,8 @@ pub enum HarnessId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningLevel {
+    /// Disable extended reasoning.
+    Off,
     Minimal,
     Low,
     Medium,
@@ -566,10 +570,18 @@ mod tests {
     }
 
     #[test]
-    fn harness_id_uses_kebab_case() {
+    fn harness_and_reasoning_ids_use_kebab_case() {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&HarnessId::Aside).unwrap(),
+            "\"aside\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ReasoningLevel::Off).unwrap(),
+            "\"off\""
         );
     }
 }

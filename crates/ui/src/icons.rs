@@ -202,6 +202,8 @@ icon_assets![
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),
     (OPENCODE_MARK, "opencode-mark"),
+    // Original monochrome Aside mark; no official redistributable asset is used.
+    (ASIDE_MARK, "aside-mark"),
     (ANTIGRAVITY_MARK, "antigravity-mark"),
 ];
 

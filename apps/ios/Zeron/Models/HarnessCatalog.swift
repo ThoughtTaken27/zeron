@@ -1,5 +1,5 @@
 // Harness + model catalogs — ports of crates/harness's curated static
-// catalogs (claude/catalog.rs, codex/catalog.rs). Desktop discovers at runtime;
+// catalogs (claude/catalog.rs, codex/catalog.rs, aside/mod.rs). Desktop discovers at runtime;
 // the phone mirrors its run device's live catalog and falls back to these.
 // Defaults mirror pickers.rs: first catalog row, reasoning high where the
 // ladder has it, else medium/first.
@@ -36,7 +36,7 @@ struct ModelInfo: Identifiable, Hashable {
     let description: String?
     /// Unified reasoning ladder, lowercase wire values. Empty = no efforts.
     let reasoningLevels: [String]
-    /// Harness-specific traits such as Codex Standard/Fast.
+    /// Harness-specific traits such as Codex Standard/Fast and Aside effort/permissions.
     let options: [ModelOptionInfo]
 
     init(id: String, label: String, description: String?, reasoningLevels: [String],
@@ -71,6 +71,7 @@ enum HarnessCatalog {
         "cursor": "Cursor",
         "opencode": "OpenCode",
         "antigravity": "Antigravity",
+        "aside": "Aside",
         "mock": "Mock",
     ]
 
@@ -88,6 +89,30 @@ enum HarnessCatalog {
             ModelOptionChoiceInfo(id: "default", label: "Standard"),
             ModelOptionChoiceInfo(id: "fast", label: "Fast"),
         ], defaultChoice: "default"),
+    ]
+    /// Aside's static fallback mirrors aside::static_models. The route is the
+    /// model id; effort and permission are explicit options because the
+    /// public CLI exposes them, while provider/host values remain dynamic.
+    private static let asideEffortOption = ModelOptionInfo(
+        id: "effort", label: "Thinking Effort", choices: [
+            ModelOptionChoiceInfo(id: "default", label: "Default"),
+            ModelOptionChoiceInfo(id: "off", label: "Off"),
+            ModelOptionChoiceInfo(id: "minimal", label: "Minimal"),
+            ModelOptionChoiceInfo(id: "low", label: "Low"),
+            ModelOptionChoiceInfo(id: "medium", label: "Medium"),
+            ModelOptionChoiceInfo(id: "high", label: "High"),
+            ModelOptionChoiceInfo(id: "xhigh", label: "XHigh"),
+            ModelOptionChoiceInfo(id: "max", label: "Max"),
+            ModelOptionChoiceInfo(id: "ultrabrowse", label: "UltraBrowse"),
+        ], defaultChoice: "default")
+    private static let asidePermissionOption = ModelOptionInfo(
+        id: "permission", label: "Permission", choices: [
+            ModelOptionChoiceInfo(id: "ask", label: "Ask"),
+            ModelOptionChoiceInfo(id: "guard", label: "Guard"),
+            ModelOptionChoiceInfo(id: "full-access", label: "Full Access"),
+        ], defaultChoice: "guard")
+    private static let asideReasoningLadder = [
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
     ]
 
     static func models(for harness: String) -> [ModelInfo] {
@@ -142,6 +167,20 @@ enum HarnessCatalog {
                 ModelInfo(id: "gemini-3.1-pro", label: "Gemini 3.1 Pro",
                           description: "Google's most capable Gemini model through Antigravity",
                           reasoningLevels: ["low", "high"]),
+            ]
+        case "aside":
+            // Aside has no stable public model-list endpoint. Keep the
+            // picker on its two documented routing entries; a reachable host
+            // still returns this same static catalog from the Rust adapter.
+            return [
+                ModelInfo(id: "default", label: "Default",
+                          description: "Aside's default model routing",
+                          reasoningLevels: asideReasoningLadder,
+                          options: [asideEffortOption, asidePermissionOption]),
+                ModelInfo(id: "fast", label: "Fast",
+                          description: "Aside's fast model routing",
+                          reasoningLevels: asideReasoningLadder,
+                          options: [asideEffortOption, asidePermissionOption]),
             ]
         case "codex":
             return [
@@ -222,6 +261,7 @@ enum HarnessCatalog {
         case "ultra": return "Ultra"
         case "ultracode": return "Ultracode"
         case "ultrathink": return "Ultrathink"
+        case "off": return "Off"
         default: return level.capitalized
         }
     }

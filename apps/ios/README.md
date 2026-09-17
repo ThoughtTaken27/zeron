@@ -42,6 +42,10 @@ The workflow uses the `AC_API_KEY_P8`, `AC_API_KEY_ID`, and
 - **Demo mode**: fully offline dataset with a scripted streaming reply —
   explore the UI with no infrastructure. Launch args for screenshot rigs:
   `-demo [-route chat:<id>|space:<id>] [-stream]`.
+- **Aside**: the iOS app mirrors the host's Aside harness metadata and sends
+  runs to a desktop host; it never runs the Aside CLI locally. The host needs
+  the macOS-first Aside app, daemon, keychain access, and official CLI. See
+  the [Aside CLI reference](../../docs/reference/aside-cli.md).
 
 ### Sessions without a project
 

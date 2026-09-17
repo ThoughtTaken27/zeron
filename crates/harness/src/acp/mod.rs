@@ -154,6 +154,7 @@ fn default_effort_values(
         return Vec::new();
     };
     match level {
+        ReasoningLevel::Off => Vec::new(),
         ReasoningLevel::Minimal => vec!["minimal", "low"],
         ReasoningLevel::Low => vec!["low", "minimal"],
         ReasoningLevel::Medium => vec!["medium"],

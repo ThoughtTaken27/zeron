@@ -61,6 +61,7 @@ not built yet).
 | Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
+| Aside CLI adapter | done (bounded) | macOS-first native adapter over the public `aside mcp` JSON-RPC surface; static `Default`/`Fast` routes, `off` through `max` plus `ultrabrowse` effort choices, permission/provider/host forwarding, resume, in-turn steer, stop, and explicit remote-host support. Aside has no stable public model catalog, and MCP returns completed results rather than a stream of tool events, so Zeron does not promise streaming tool events or token deltas. Requires the Aside app/daemon/keychain environment; `ASIDE_EXECUTABLE` overrides CLI resolution. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema
@@ -97,7 +98,7 @@ not built yet).
 
 ## Deferred (cross-cutting)
 
-- **Mobile app** — out of scope for the native rewrite so far.
+- **Mobile full parity** — the iOS peer app has catalog, capability, and remote-host mirrors; complete feature parity with the desktop remains outside this checklist.
 - **E2EE** — transport is TLS + WorkOS bearers; end-to-end encryption of doc
   contents not designed.
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
@@ -106,6 +107,6 @@ not built yet).
 
 ## Summary
 
-Table rows above: **40 done · 6 partial**, plus the cross-cutting deferrals
+Table rows above: **41 done · 6 partial**, plus the cross-cutting deferrals
 (mobile, E2EE, macOS packaging execution, engine hardening) — the last
 overlaps the named gaps in the partial rows.

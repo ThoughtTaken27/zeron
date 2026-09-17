@@ -387,9 +387,9 @@ impl HarnessRegistry {
     }
 }
 
-/// The production registry: MockHarness (hidden from production pickers) plus a lazy
-/// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
-/// discovery only happens when a run/model call actually needs it).
+/// The production registry: MockHarness (hidden from production pickers) plus lazy
+/// slots for each external agent, resolved through `zeron_harness` on first use
+/// (subprocess discovery only happens when a run/model call actually needs it).
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
@@ -622,6 +622,30 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
     );
+    // Aside is macOS-first and accepts the documented in-turn `session steer`
+    // command. Keep the descriptor in the catalog even when the CLI is absent so Settings can
+    // show the install guidance; both probing and construction remain lazy.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Aside,
+            name: "Aside".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Off,
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| zeron_harness::aside::AsideHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(zeron_harness::aside::AsideHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -687,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
+    fn default_registry_lists_registered_harness_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
@@ -702,7 +726,8 @@ mod tests {
                 HarnessId::Hermes,
                 HarnessId::Pi,
                 HarnessId::Opencode,
-                HarnessId::Antigravity
+                HarnessId::Antigravity,
+                HarnessId::Aside
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -773,6 +798,22 @@ mod tests {
                 ReasoningLevel::High,
                 ReasoningLevel::XHigh,
                 ReasoningLevel::Max
+            ]
+        );
+        let aside = registry.resolve(HarnessId::Aside).unwrap();
+        assert_eq!(aside.id(), HarnessId::Aside);
+        assert_eq!(aside.display_name(), "Aside");
+        assert_eq!(aside.steering_mode(), SteeringMode::StepBoundary);
+        assert_eq!(
+            aside.reasoning_levels(),
+            &[
+                ReasoningLevel::Off,
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
             ]
         );
     }

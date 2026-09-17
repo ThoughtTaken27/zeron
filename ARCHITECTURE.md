@@ -1,7 +1,7 @@
 # zeron — Architecture
 
 A ground-up native rewrite of [zeron](../zeron) — a multi-device controller for coding agents
-(Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
+(Claude Code / Codex / Aside and other coding agents) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
 
 **Pillars (from the goal):**
 - Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects; the same docs persist locally when sync is disabled.
@@ -140,7 +140,8 @@ zeron/
                                  # ephemeral presence, DocsStore (SQLite snapshots +
                                  # processed-command ledger)
     harness/      zeron-harness  # Harness trait + claude-code (stream-json subprocess),
-                                 # codex (app-server JSON-RPC), mock; steering mailbox,
+                                 # codex (app-server JSON-RPC), Aside (public MCP CLI), mock;
+                                 # steering mailbox,
                                  # requestInput, models/reasoning/options catalogs
     engine/       zeron-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
@@ -230,7 +231,9 @@ Direct ports of zeron behaviors (spec: feature-inventory §3):
 - **Harness** (research pending — `docs/research/harness.md`): trait mirroring zeron's
   `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
   permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
-  `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
+  `codex exec --json`; Aside via the public `aside mcp` JSON-RPC CLI surface (completion-oriented,
+  session resume/steer/stop, static routing catalog); model/reasoning/option catalogs ported from
+  `packages/harness`.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches zeron, avoids libgit2 edge
   cases); worktrees under `~/.zeron/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff

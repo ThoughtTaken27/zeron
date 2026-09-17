@@ -224,6 +224,7 @@ pub fn clamp_reasoning(
 
 pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     match level {
+        ReasoningLevel::Off => "Off",
         ReasoningLevel::Minimal => "Minimal",
         ReasoningLevel::Low => "Low",
         ReasoningLevel::Medium => "Medium",
@@ -4436,6 +4437,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Pi => (crate::icons::PI_MARK, None),
         // The pixel-"o" from opencode's wordmark (their favicon), monochrome.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
+        HarnessId::Aside => (crate::icons::ASIDE_MARK, None),
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
     }
 }
@@ -4777,6 +4779,15 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn aside_has_monochrome_picker_branding_and_off_reasoning_label() {
+        assert_eq!(
+            harness_brand_icon(HarnessId::Aside),
+            (crate::icons::ASIDE_MARK, None)
+        );
+        assert_eq!(reasoning_label(ReasoningLevel::Off), "Off");
+    }
 
     #[gpui::test]
     fn workspace_footer_pair_keeps_its_leading_edge_and_gap(cx: &mut gpui::TestAppContext) {
