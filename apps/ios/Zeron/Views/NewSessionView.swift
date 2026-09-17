@@ -763,6 +763,7 @@ struct TraitPickerSheet: View {
     static func effortHint(_ level: String) -> String? {
         switch level {
         case "minimal": return "Quickest, lightest touch"
+        case "off": return "Reasoning disabled"
         case "low": return "Fastest responses"
         case "medium": return "Balanced speed and depth"
         case "high": return "Thorough reasoning"

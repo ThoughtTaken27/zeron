@@ -45,7 +45,7 @@ fn remove_env(key: &str) {
     unsafe { std::env::remove_var(key) }
 }
 
-fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
+fn make_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
@@ -116,7 +116,7 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
         .model_options
         .insert("provider".into(), "openai".into());
     happy.model_options.insert("host".into(), "local".into());
-    let (controls, _steer, _interrupt) = controls();
+    let (controls, _steer, _interrupt) = make_controls();
     let events = run_to_end(&harness, happy, controls).await;
     assert!(
         events
@@ -126,24 +126,24 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Completed, session_id: Some(id), .. } if id == "ses-happy")));
 
     set_env("ASIDE_FAKE_SCENARIO", "error");
-    let (controls, _steer, _interrupt) = controls();
-    let events = run_to_end(&harness, request("fail"), controls).await;
+    let (error_controls, _steer, _interrupt) = make_controls();
+    let events = run_to_end(&harness, request("fail"), error_controls).await;
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), .. } if error == "agent failed")));
 
     set_env("ASIDE_FAKE_SCENARIO", "resume");
     let mut follow_up = request("continue");
     follow_up.resume = Some("ses-happy".into());
-    let (controls, _steer, _interrupt) = controls();
-    let events = run_to_end(&harness, follow_up, controls).await;
+    let (resume_controls, _steer, _interrupt) = make_controls();
+    let events = run_to_end(&harness, follow_up, resume_controls).await;
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Completed, session_id: Some(id), .. } if id == "ses-resumed")));
 
     set_env("ASIDE_FAKE_SCENARIO", "hold");
     let mut live = request("keep working");
     live.resume = Some("ses-live".into());
-    let (controls, steer, interrupt) = controls();
+    let (live_controls, steer, interrupt) = make_controls();
     let stream = harness
         .with_graces(Duration::from_millis(50), Duration::from_millis(50))
-        .run(live, controls)
+        .run(live, live_controls)
         .await
         .unwrap();
     steer

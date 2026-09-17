@@ -570,7 +570,7 @@ final class WorkspaceStore {
             list.filter { h in
                 h.id != "mock"
                     && (h.installed ?? true)
-                    && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
+                    && (h.enabled ?? ["claude-code", "codex", "aside"].contains(h.id))
             }
             .map { HarnessInfo(id: $0.id, label: $0.name,
                                supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode) }

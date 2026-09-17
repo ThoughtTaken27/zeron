@@ -14,8 +14,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::{Map, Value, json};
+use tokio::io::AsyncBufReadExt;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -362,7 +364,8 @@ impl Harness for AsideHarness {
         Ok(futures::stream::unfold(
             event_rx,
             |mut receiver| async move { receiver.recv().await.map(|event| (event, receiver)) },
-        ))
+        )
+        .boxed())
     }
 }
 
@@ -410,7 +413,7 @@ async fn run_session(session: AsideSession) {
         result = initialize => result,
         _ = interrupt.cancelled() => {
             emit_done(&event_tx, DoneStatus::Interrupted, None, None, request.resume.clone()).await;
-            shutdown_child(child, kill_grace).await;
+            shutdown_child(&mut child, kill_grace).await;
             return;
         }
     } {
@@ -422,7 +425,7 @@ async fn run_session(session: AsideSession) {
             None,
         )
         .await;
-        shutdown_child(child, kill_grace).await;
+        shutdown_child(&mut child, kill_grace).await;
         return;
     }
     client.notify("notifications/initialized", None);
@@ -507,7 +510,7 @@ async fn run_session(session: AsideSession) {
             interrupted_session_id,
         )
         .await;
-        shutdown_child(child, kill_grace).await;
+        shutdown_child(&mut child, kill_grace).await;
         return;
     }
 
@@ -568,7 +571,7 @@ async fn run_session(session: AsideSession) {
             .await;
         }
     }
-    shutdown_child(child, kill_grace).await;
+    shutdown_child(&mut child, kill_grace).await;
 }
 
 struct MappedResult {
