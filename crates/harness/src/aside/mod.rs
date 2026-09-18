@@ -201,14 +201,69 @@ fn model_id_from(entry: &serde_json::Map<String, Value>) -> Option<String> {
     None
 }
 
-/// Parse a `models.json` value into `(provider, model ids)` rows.
+fn display_name_from_entry(entry: &serde_json::Map<String, Value>, fallback: &str) -> String {
+    // Display-only: the `name` field never contributes to row ids.
+    entry
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn push_model_ids_from_value(value: &Value, ids: &mut Vec<String>) {
+    if let Some(text) = value.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+        ids.push(text.to_owned());
+    } else if let Some(entry) = value.as_object() {
+        if let Some(id) = model_id_from(entry) {
+            ids.push(id);
+        }
+    }
+}
+
+fn dedup_ids(ids: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+}
+
+/// Collect model ids from `models[]` plus `accountModelCatalog`.
 ///
-/// Reads ONLY `providers[]` -> provider `id`/`name` plus each model's id-ish
-/// keys (`id`/`modelId`/`model`/`name`). Secret-adjacent fields (`apiKey`,
-/// `authHeader`, `baseUrl`, …) are never read and never logged. `providers`
-/// may be an array or a map; `models[]` entries may be objects or bare
-/// strings. Providers without models are skipped.
-pub fn parse_models_catalog(value: &Value) -> Vec<(String, Vec<String>)> {
+/// `accountModelCatalog` may hold `modelIds[]` (plain strings) or a `models[]`
+/// list variant (strings or objects). Both shapes are merged; callers deduplicate.
+/// Secret-adjacent fields are never read.
+fn collect_model_ids(entry: &serde_json::Map<String, Value>) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(models) = entry.get("models").and_then(Value::as_array) {
+        for model in models {
+            push_model_ids_from_value(model, &mut ids);
+        }
+    }
+    if let Some(catalog) = entry.get("accountModelCatalog") {
+        if let Some(obj) = catalog.as_object() {
+            for key in ["modelIds", "model_ids", "models"] {
+                if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+                    for model in arr {
+                        push_model_ids_from_value(model, &mut ids);
+                    }
+                }
+            }
+        } else if let Some(arr) = catalog.as_array() {
+            for model in arr {
+                push_model_ids_from_value(model, &mut ids);
+            }
+        }
+    }
+    dedup_ids(&mut ids);
+    ids
+}
+
+/// Inner catalog with display names: `(true provider id, display name, model ids)`.
+///
+/// For the dict shape the TRUE id is always the dict key; the entry `name`
+/// field is captured only as display text for descriptions. For the array
+/// shape the id still comes from the entry (`id` then `name`).
+fn parse_catalog_with_display(value: &Value) -> Vec<(String, String, Vec<String>)> {
     let mut catalog = Vec::new();
     match value.get("providers") {
         Some(Value::Array(providers)) => {
@@ -219,71 +274,37 @@ pub fn parse_models_catalog(value: &Value) -> Vec<(String, Vec<String>)> {
                 let Some(provider_id) = provider_id_from(entry, None) else {
                     continue;
                 };
-                let models = entry
-                    .get("models")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default();
-                let mut ids = Vec::new();
-                for model in models {
-                    if let Some(text) = model.as_str().map(str::trim).filter(|t| !t.is_empty()) {
-                        ids.push(text.to_owned());
-                    } else if let Some(entry) = model.as_object() {
-                        if let Some(id) = model_id_from(entry) {
-                            ids.push(id);
-                        }
-                    }
-                }
+                let display = display_name_from_entry(entry, &provider_id);
+                let ids = collect_model_ids(entry);
                 if !ids.is_empty() {
-                    catalog.push((provider_id, ids));
+                    catalog.push((provider_id, display, ids));
                 }
             }
         }
         Some(Value::Object(map)) => {
             for (key, provider) in map {
+                let trimmed = key.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
                 if let Some(entry) = provider.as_object() {
-                    let Some(provider_id) = provider_id_from(entry, Some(key)) else {
-                        continue;
-                    };
-                    let models = entry
-                        .get("models")
-                        .and_then(Value::as_array)
-                        .map(Vec::as_slice)
-                        .unwrap_or_default();
-                    let mut ids = Vec::new();
-                    for model in models {
-                        if let Some(text) =
-                            model.as_str().map(str::trim).filter(|t| !t.is_empty())
-                        {
-                            ids.push(text.to_owned());
-                        } else if let Some(entry) = model.as_object() {
-                            if let Some(id) = model_id_from(entry) {
-                                ids.push(id);
-                            }
-                        }
-                    }
+                    // TRUE id is the dict key; ignore entry `id`/`name` for ids.
+                    let provider_id = trimmed.to_owned();
+                    let display = display_name_from_entry(entry, &provider_id);
+                    let ids = collect_model_ids(entry);
                     if !ids.is_empty() {
-                        catalog.push((provider_id, ids));
+                        catalog.push((provider_id, display, ids));
                     }
                 } else if let Some(models) = provider.as_array() {
-                    let provider_id = key.trim();
-                    if provider_id.is_empty() {
-                        continue;
-                    }
+                    let provider_id = trimmed.to_owned();
+                    let display = provider_id.clone();
                     let mut ids = Vec::new();
                     for model in models {
-                        if let Some(text) =
-                            model.as_str().map(str::trim).filter(|t| !t.is_empty())
-                        {
-                            ids.push(text.to_owned());
-                        } else if let Some(entry) = model.as_object() {
-                            if let Some(id) = model_id_from(entry) {
-                                ids.push(id);
-                            }
-                        }
+                        push_model_ids_from_value(model, &mut ids);
                     }
+                    dedup_ids(&mut ids);
                     if !ids.is_empty() {
-                        catalog.push((provider_id.to_owned(), ids));
+                        catalog.push((provider_id, display, ids));
                     }
                 }
             }
@@ -291,6 +312,25 @@ pub fn parse_models_catalog(value: &Value) -> Vec<(String, Vec<String>)> {
         _ => {}
     }
     catalog
+}
+
+/// Parse a `models.json` value into `(provider, model ids)` rows.
+///
+/// The TRUE provider id for the dict shape is the dict key (e.g.
+/// `bedrock-claude`); the entry `name` field (e.g. `Bedrock Claude`) is
+/// display-only and never becomes part of a row id. Reads ONLY provider
+/// keys plus each model's id-ish keys (`id`/`modelId`/`model`/`name`) and
+/// `accountModelCatalog` (`modelIds[]` strings or a `models[]` list variant).
+/// Secret-adjacent fields (`apiKey`, `authHeader`, `baseUrl`, …) are never
+/// read and never logged. `providers` may be an array or a map; `models[]`
+/// entries may be objects or bare strings. Providers without models are
+/// skipped. Duplicate model strings within a provider (e.g. via both shapes)
+/// appear once.
+pub fn parse_models_catalog(value: &Value) -> Vec<(String, Vec<String>)> {
+    parse_catalog_with_display(value)
+        .into_iter()
+        .map(|(id, _, models)| (id, models))
+        .collect()
 }
 
 /// Parse `settings.json` `defaultModel { provider, modelId }` (non-secret).
@@ -337,11 +377,11 @@ fn full_reasoning_ladder() -> Vec<ReasoningLevel> {
     ]
 }
 
-fn discovered_row(provider: &str, model_id: &str) -> Model {
+fn discovered_row(provider: &str, display: &str, model_id: &str) -> Model {
     Model {
         id: format!("{provider}/{model_id}"),
         label: model_id.into(),
-        description: Some(format!("{provider} via Aside")),
+        description: Some(format!("{display} via Aside")),
         reasoning_levels: full_reasoning_ladder(),
         options: vec![effort_option(), permission_option()],
     }
@@ -565,7 +605,7 @@ impl AsideHarness {
             );
             return (Vec::new(), signed_in);
         };
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs: Vec<(String, String, String)> = Vec::new();
         let mut first_default: Option<(String, String)> = None;
         for account_id in &signed_in {
             let Some(dir) = account_dir(&home, account_id) else {
@@ -595,9 +635,10 @@ impl AsideHarness {
                     continue;
                 }
             };
-            for (provider, model_ids) in parse_models_catalog(&models_value) {
+            for (provider, display, model_ids) in parse_catalog_with_display(&models_value) {
                 for model_id in model_ids {
-                    pairs.push((provider.clone(), model_id));
+                    // (true provider id, model id, display-only name).
+                    pairs.push((provider.clone(), model_id, display.clone()));
                 }
             }
             if first_default.is_none() {
@@ -627,18 +668,31 @@ impl AsideHarness {
         if pairs.is_empty() {
             return (Vec::new(), signed_in);
         }
-        pairs.sort();
-        pairs.dedup();
+        // Sort by TRUE `{provider}/{model}` id form; display text never affects
+        // ordering. Stable sort preserves first-seen display for duplicates.
+        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut deduped: Vec<(String, String, String)> = Vec::new();
+        {
+            let mut seen_pairs = std::collections::HashSet::new();
+            for (provider, model_id, display) in pairs {
+                if seen_pairs.insert((provider.clone(), model_id.clone())) {
+                    deduped.push((provider, model_id, display));
+                }
+            }
+        }
         let mut rows: Vec<Model> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
-        for (provider, model_id) in pairs {
+        for (provider, model_id, display) in deduped {
             let id = format!("{provider}/{model_id}");
             if !seen_ids.insert(id.clone()) {
                 continue;
             }
-            rows.push(discovered_row(&provider, &model_id));
+            rows.push(discovered_row(&provider, &display, &model_id));
         }
         if let Some((default_provider, default_model)) = first_default {
+            // Promotion compares against the TRUE `{provider}/{model}` id form
+            // (e.g. `bedrock-claude/<model>`), matching `settings.json`
+            // `defaultModel { provider, modelId }`.
             let default_id = format!("{default_provider}/{default_model}");
             if let Some(index) = rows.iter().position(|row| row.id == default_id) {
                 if index != 0 {

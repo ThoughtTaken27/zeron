@@ -366,3 +366,209 @@ async fn dynamic_catalog_imports_models_orders_default_and_routes_account() {
         assert_eq!(option.default_choice.as_str(), "u0");
     }
 }
+
+#[test]
+fn catalog_parser_uses_dict_keys_and_collects_account_catalog() {
+    // Dict shape: TRUE id is the dict key; `name` is display-only.
+    // `openai-codex`-style provider has no `models[]`, only
+    // `accountModelCatalog.modelIds[]`. All values fake.
+    let value = serde_json::json!({
+        "providers": {
+            "bedrock-claude": {
+                "name": "Bedrock Claude",
+                "apiKey": "FAKE-SECRET-DO-NOT-USE",
+                "baseUrl": "https://fake.example.invalid",
+                "models": [{"id": "fake-bedrock-model-a"}, "fake-shared-model"],
+                "accountModelCatalog": {
+                    "modelIds": ["fake-shared-model", "fake-bedrock-model-b"]
+                }
+            },
+            "openai-codex": {
+                "apiKey": "FAKE-SECRET-DO-NOT-USE",
+                "accountModelCatalog": {
+                    "modelIds": ["fake-codex-model-1"]
+                }
+            },
+            "fake-variant": {
+                "name": "Fake Display",
+                "models": ["fake-variant-model-1"],
+                "accountModelCatalog": {
+                    "models": ["fake-variant-model-1", "fake-variant-model-2"]
+                }
+            }
+        }
+    });
+    let catalog = zeron_harness::aside::parse_models_catalog(&value);
+    let by_id: std::collections::HashMap<_, _> =
+        catalog.into_iter().collect();
+    // Row ids use dict keys, never the display `name`.
+    assert!(by_id.contains_key("bedrock-claude"));
+    assert!(by_id.contains_key("openai-codex"));
+    assert!(by_id.contains_key("fake-variant"));
+    assert!(!by_id.contains_key("Bedrock Claude"));
+    assert!(!by_id.contains_key("Fake Display"));
+    // Both shapes merged + deduplicated within a provider.
+    assert_eq!(
+        by_id["bedrock-claude"],
+        vec![
+            "fake-bedrock-model-a",
+            "fake-shared-model",
+            "fake-bedrock-model-b"
+        ]
+    );
+    assert_eq!(by_id["openai-codex"], vec!["fake-codex-model-1"]);
+    assert_eq!(
+        by_id["fake-variant"],
+        vec!["fake-variant-model-1", "fake-variant-model-2"]
+    );
+    for (_, ids) in &by_id {
+        for id in ids {
+            assert!(!id.contains("FAKE-SECRET"));
+            assert!(!id.contains("fake.example"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn dict_catalog_uses_true_ids_collects_account_models_promotes_default() {
+    let _lock = home_lock();
+    let home = tempfile::tempdir().unwrap();
+    let account_dir = home.path().join(".aside").join("u").join("0");
+    std::fs::create_dir_all(&account_dir).unwrap();
+    // Fake dict-shape fixture mirroring the verified `models.json` shape:
+    // - `bedrock-claude` key with `name: Bedrock Claude` (name != key);
+    // - `openai-codex` with NO `models[]`, models only in
+    //   `accountModelCatalog.modelIds[]`;
+    // - `models`-list variant inside `accountModelCatalog`;
+    // - one model duplicated across both shapes (must appear once).
+    // Secret-adjacent fields carry fake values only. No real user data.
+    std::fs::write(
+        account_dir.join("models.json"),
+        serde_json::json!({
+            "providers": {
+                "bedrock-claude": {
+                    "name": "Bedrock Claude",
+                    "apiKey": "FAKE-SECRET-DO-NOT-USE",
+                    "authHeader": "FAKE-SECRET-DO-NOT-USE",
+                    "baseUrl": "https://fake.example.invalid",
+                    "models": [
+                        {"id": "fake-bedrock-model-b"},
+                        {"id": "fake-bedrock-model-a"},
+                        "fake-shared-model"
+                    ],
+                    "accountModelCatalog": {
+                        "modelIds": ["fake-shared-model", "fake-bedrock-model-c"]
+                    }
+                },
+                "openai-codex": {
+                    "apiKey": "FAKE-SECRET-DO-NOT-USE",
+                    "baseUrl": "https://fake.example.invalid",
+                    "accountModelCatalog": {
+                        "modelIds": ["fake-codex-model-2", "fake-codex-model-1"]
+                    }
+                },
+                "fake-variant": {
+                    "name": "Fake Display",
+                    "models": ["fake-variant-model-1"],
+                    "accountModelCatalog": {
+                        "models": [{"id": "fake-variant-model-1"}, "fake-variant-model-2"]
+                    }
+                },
+                "fake-empty": {
+                    "name": "Fake Empty Display",
+                    "apiKey": "FAKE-SECRET-DO-NOT-USE"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // `bedrock-claude`-style default: provider matches the dict KEY, not the
+    // display name. Promotion must move it to index 2.
+    std::fs::write(
+        account_dir.join("settings.json"),
+        serde_json::json!({
+            "defaultModel": {
+                "provider": "bedrock-claude",
+                "modelId": "fake-bedrock-model-b",
+                "thinkingLevel": "whatever",
+                "fastMode": false
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bin = tempfile::tempdir().unwrap();
+    let fake = bin.path().join("fake-aside-dict-accounts.sh");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nset -eu\ncase \" $* \" in\n*\" account list \"*)\nprintf '%s\\n' '* u0  redacted  signed in  profiles: Profile 0'\nprintf '%s\\n' 'provider: redacted'\nexit 0\n;;\nesac\nexit 0\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let _home_guard = HomeGuard::set_to(home.path());
+    let harness = AsideHarness::new().with_executable(fake.clone());
+    let models = harness.models().await.unwrap();
+
+    // 2 static + 8 unique discovered rows (4 bedrock + 2 codex + 2 variant).
+    // Duplicates across shapes appear once; empty provider skipped.
+    assert_eq!(models.len(), 2 + 8, "ids: {:?}", models.iter().map(|m| &m.id).collect::<Vec<_>>());
+    assert_eq!(models[0].id.as_str(), "default");
+    assert_eq!(models[1].id.as_str(), "fast");
+    // Promotion hits the TRUE `{provider}/{model}` id form.
+    assert_eq!(models[2].id.as_str(), "bedrock-claude/fake-bedrock-model-b");
+    let rest: Vec<_> = models[3..].iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        rest,
+        vec![
+            "bedrock-claude/fake-bedrock-model-a",
+            "bedrock-claude/fake-bedrock-model-c",
+            "bedrock-claude/fake-shared-model",
+            "fake-variant/fake-variant-model-1",
+            "fake-variant/fake-variant-model-2",
+            "openai-codex/fake-codex-model-1",
+            "openai-codex/fake-codex-model-2",
+        ]
+    );
+    // Row ids use dict keys, never the display `name`.
+    for model in &models[2..] {
+        assert!(
+            !model.id.contains("Bedrock Claude") && !model.id.contains("Fake Display"),
+            "id must use dict key: {}",
+            model.id
+        );
+    }
+    // Display `name` is used ONLY for the description text.
+    for model in &models[2..] {
+        let description = model.description.as_deref().unwrap();
+        assert!(description.ends_with(" via Aside"), "{description}");
+        if model.id.starts_with("bedrock-claude/") {
+            assert_eq!(description, "Bedrock Claude via Aside");
+        } else if model.id.starts_with("openai-codex/") {
+            assert_eq!(description, "openai-codex via Aside");
+        } else if model.id.starts_with("fake-variant/") {
+            assert_eq!(description, "Fake Display via Aside");
+        }
+        assert_eq!(model.label.as_str(), model.id.split('/').nth(1).unwrap());
+    }
+    // No duplicates across the whole catalog.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for model in &models {
+            assert!(seen.insert(model.id.clone()), "duplicate id: {}", model.id);
+        }
+    }
+    // Secrets never leak into ids or descriptions.
+    for model in &models {
+        assert!(!model.id.contains("FAKE-SECRET"));
+        assert!(!model.id.contains("fake.example"));
+        let description = model.description.as_deref().unwrap_or("");
+        assert!(!description.contains("FAKE-SECRET"));
+    }
+}
