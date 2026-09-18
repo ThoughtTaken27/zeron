@@ -10,7 +10,7 @@
 //! terminal `Done` event. Session ids are carried through both the start and
 //! terminal events and are passed back to `exec` for follow-up turns.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -134,6 +134,234 @@ fn permission_option() -> ModelOption {
     }
 }
 
+/// Parse `aside account list` output into `(account id, signed-in)` rows.
+///
+/// Only the account id (`u` + digits) and the signed-in boolean are extracted;
+/// emails and every other column are ignored/redacted. Lines without a
+/// `signed in` / `signed out` marker or without a `u<digits>` token are
+/// skipped. There is no `--json` flag, so this parses the human table shape
+/// (`* u0 <email> signed in profiles: ...`).
+pub fn parse_account_list(text: &str) -> Vec<(String, bool)> {
+    let mut accounts = Vec::new();
+    for line in text.lines() {
+        let lower = line.to_lowercase();
+        let signed_in = if lower.contains("signed in") {
+            true
+        } else if lower.contains("signed out") {
+            false
+        } else {
+            continue;
+        };
+        let mut found: Option<String> = None;
+        for raw in line.split_whitespace() {
+            let token = raw.trim_matches(|c| c == '*' || c == ',' || c == ':');
+            if token.len() > 1
+                && token.starts_with('u')
+                && token[1..].chars().all(|c| c.is_ascii_digit())
+            {
+                found = Some(token.to_owned());
+                break;
+            }
+        }
+        if let Some(id) = found {
+            accounts.push((id, signed_in));
+        }
+    }
+    accounts
+}
+
+fn provider_id_from(entry: &serde_json::Map<String, Value>, fallback: Option<&str>) -> Option<String> {
+    for key in ["id", "name"] {
+        if let Some(id) = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return Some(id.to_owned());
+        }
+    }
+    fallback
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn model_id_from(entry: &serde_json::Map<String, Value>) -> Option<String> {
+    for key in ["id", "modelId", "model", "name"] {
+        if let Some(id) = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return Some(id.to_owned());
+        }
+    }
+    None
+}
+
+/// Parse a `models.json` value into `(provider, model ids)` rows.
+///
+/// Reads ONLY `providers[]` -> provider `id`/`name` plus each model's id-ish
+/// keys (`id`/`modelId`/`model`/`name`). Secret-adjacent fields (`apiKey`,
+/// `authHeader`, `baseUrl`, …) are never read and never logged. `providers`
+/// may be an array or a map; `models[]` entries may be objects or bare
+/// strings. Providers without models are skipped.
+pub fn parse_models_catalog(value: &Value) -> Vec<(String, Vec<String>)> {
+    let mut catalog = Vec::new();
+    match value.get("providers") {
+        Some(Value::Array(providers)) => {
+            for provider in providers {
+                let Some(entry) = provider.as_object() else {
+                    continue;
+                };
+                let Some(provider_id) = provider_id_from(entry, None) else {
+                    continue;
+                };
+                let models = entry
+                    .get("models")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let mut ids = Vec::new();
+                for model in models {
+                    if let Some(text) = model.as_str().map(str::trim).filter(|t| !t.is_empty()) {
+                        ids.push(text.to_owned());
+                    } else if let Some(entry) = model.as_object() {
+                        if let Some(id) = model_id_from(entry) {
+                            ids.push(id);
+                        }
+                    }
+                }
+                if !ids.is_empty() {
+                    catalog.push((provider_id, ids));
+                }
+            }
+        }
+        Some(Value::Object(map)) => {
+            for (key, provider) in map {
+                if let Some(entry) = provider.as_object() {
+                    let Some(provider_id) = provider_id_from(entry, Some(key)) else {
+                        continue;
+                    };
+                    let models = entry
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
+                    let mut ids = Vec::new();
+                    for model in models {
+                        if let Some(text) =
+                            model.as_str().map(str::trim).filter(|t| !t.is_empty())
+                        {
+                            ids.push(text.to_owned());
+                        } else if let Some(entry) = model.as_object() {
+                            if let Some(id) = model_id_from(entry) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                    if !ids.is_empty() {
+                        catalog.push((provider_id, ids));
+                    }
+                } else if let Some(models) = provider.as_array() {
+                    let provider_id = key.trim();
+                    if provider_id.is_empty() {
+                        continue;
+                    }
+                    let mut ids = Vec::new();
+                    for model in models {
+                        if let Some(text) =
+                            model.as_str().map(str::trim).filter(|t| !t.is_empty())
+                        {
+                            ids.push(text.to_owned());
+                        } else if let Some(entry) = model.as_object() {
+                            if let Some(id) = model_id_from(entry) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                    if !ids.is_empty() {
+                        catalog.push((provider_id.to_owned(), ids));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    catalog
+}
+
+/// Parse `settings.json` `defaultModel { provider, modelId }` (non-secret).
+///
+/// Used ONLY to order the discovered catalog (that row moves right after
+/// `default`/`fast`). No other semantics are inferred; `thinkingLevel` and
+/// `fastMode` are deliberately ignored.
+pub fn parse_default_model(value: &Value) -> Option<(String, String)> {
+    let entry = value.get("defaultModel")?.as_object()?;
+    let provider = entry
+        .get("provider")
+        .or_else(|| entry.get("providerId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let model = entry
+        .get("modelId")
+        .or_else(|| entry.get("model"))
+        .or_else(|| entry.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some((provider.to_owned(), model.to_owned()))
+}
+
+/// Map `u0` -> `$HOME/.aside/u/0`. Returns `None` for unparseable ids.
+fn account_dir(home: &Path, account_id: &str) -> Option<PathBuf> {
+    let digits = account_id.strip_prefix('u')?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(home.join(".aside").join("u").join(digits))
+}
+
+fn full_reasoning_ladder() -> Vec<ReasoningLevel> {
+    vec![
+        ReasoningLevel::Off,
+        ReasoningLevel::Minimal,
+        ReasoningLevel::Low,
+        ReasoningLevel::Medium,
+        ReasoningLevel::High,
+        ReasoningLevel::XHigh,
+        ReasoningLevel::Max,
+    ]
+}
+
+fn discovered_row(provider: &str, model_id: &str) -> Model {
+    Model {
+        id: format!("{provider}/{model_id}"),
+        label: model_id.into(),
+        description: Some(format!("{provider} via Aside")),
+        reasoning_levels: full_reasoning_ladder(),
+        options: vec![effort_option(), permission_option()],
+    }
+}
+
+fn account_option(ids: &[String]) -> ModelOption {
+    ModelOption {
+        id: "account".into(),
+        label: "Account".into(),
+        choices: ids
+            .iter()
+            .map(|id| ModelOptionChoice {
+                id: id.clone(),
+                label: id.clone(),
+            })
+            .collect(),
+        default_choice: ids.first().cloned().unwrap_or_default(),
+    }
+}
+
 /// A native Aside CLI harness.
 pub struct AsideHarness {
     executable: Option<PathBuf>,
@@ -181,11 +409,23 @@ impl AsideHarness {
     }
 
     fn global_args(request: &RunRequest) -> Vec<String> {
+        Self::global_args_with_accounts(request, None)
+    }
+
+    fn global_args_with_accounts(
+        request: &RunRequest,
+        signed_in: Option<&[String]>,
+    ) -> Vec<String> {
         let mut args = Vec::new();
         let selected_model = request.model.as_deref().unwrap_or(DEFAULT_MODEL);
         let configured_speed = request.model_options.get("speed").and_then(option_string);
+        let is_slash_model = selected_model.contains('/');
         if selected_model == FAST_MODEL || configured_speed == Some(FAST_MODEL) {
             args.extend(["--speed".into(), FAST_MODEL.into()]);
+        } else if is_slash_model {
+            // Discovered rows use the `provider/model` slash form. It overrides
+            // `--provider`, so never send `-p` alongside `-m`.
+            args.extend(["-m".into(), selected_model.into()]);
         } else if selected_model != DEFAULT_MODEL && !selected_model.is_empty() {
             // Keep the adapter useful for callers that already store an
             // explicit provider/model, while the advertised catalog remains
@@ -211,12 +451,210 @@ impl AsideHarness {
         // These are documented CLI flags and are accepted from callers that
         // have a representable, explicit value, even though static_models does
         // not advertise arbitrary provider/host strings as picker choices.
+        // Host discovery is intentionally not performed (remote hosts are not
+        // probed); an explicit host value is passed through untouched.
         for id in ["provider", "host"] {
+            if is_slash_model && id == "provider" {
+                continue;
+            }
             if let Some(value) = option(id) {
                 args.extend([format!("--{id}"), value.into()]);
             }
         }
+        if let Some(account) = option("account") {
+            match signed_in {
+                Some(ids) if !ids.is_empty() => {
+                    if ids.iter().any(|id| id == account) {
+                        args.extend(["--account".into(), account.into()]);
+                    } else {
+                        tracing::debug!(
+                            target: "zeron_harness::aside",
+                            "skipping unknown aside account option"
+                        );
+                    }
+                }
+                Some(_) => {
+                    tracing::debug!(
+                        target: "zeron_harness::aside",
+                        "skipping aside account option (no signed-in accounts discovered)"
+                    );
+                }
+                None => {
+                    // Discovery did not run or failed: forward without
+                    // validation rather than hard-erroring the run.
+                    args.extend(["--account".into(), account.into()]);
+                }
+            }
+        }
         args
+    }
+
+    /// Blocking-free async discovery of signed-in account ids (Codex-style:
+    /// live per call, 10s timeout, failure returns `None`, never cached).
+    /// Only the account id + signed-in boolean are parsed; emails are ignored.
+    async fn discover_accounts(&self) -> Option<Vec<String>> {
+        let executable = match self.resolve_executable() {
+            Ok(executable) => executable,
+            Err(error) => {
+                tracing::debug!(
+                    target: "zeron_harness::aside",
+                    "aside account discovery skipped (no executable): {error}"
+                );
+                return None;
+            }
+        };
+        let mut command = Command::new(&executable);
+        command.args(["account", "list"]);
+        crate::compose_child_path(&mut command, &executable);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await
+        {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    target: "zeron_harness::aside",
+                    "aside account list failed; using fallback catalog: {error}"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    target: "zeron_harness::aside",
+                    "aside account list timed out; using fallback catalog"
+                );
+                return None;
+            }
+        };
+        if !output.status.success() {
+            tracing::debug!(
+                target: "zeron_harness::aside",
+                "aside account list exited unsuccessfully; using fallback catalog"
+            );
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let signed_in = parse_account_list(&text)
+            .into_iter()
+            .filter(|(_, signed_in)| *signed_in)
+            .map(|(id, _)| id)
+            .collect::<Vec<_>>();
+        Some(signed_in)
+    }
+
+    /// Live catalog probe: signed-in accounts -> `$HOME/.aside/u/{n}/`
+    /// `models.json` + `settings.json`. Returns `(discovered rows, signed-in
+    /// ids)`. Empty rows on any total failure (static fallback engages);
+    /// failures are never cached. Reads ONLY provider name/id + model ids
+    /// plus `defaultModel { provider, modelId }` for ordering; secret fields
+    /// are never read and file contents are never logged.
+    async fn discover_catalog(&self) -> (Vec<Model>, Vec<String>) {
+        let Some(signed_in) = self.discover_accounts().await else {
+            return (Vec::new(), Vec::new());
+        };
+        if signed_in.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(home) = crate::executable::home_dir() else {
+            tracing::debug!(
+                target: "zeron_harness::aside",
+                "aside catalog discovery skipped (no home dir)"
+            );
+            return (Vec::new(), signed_in);
+        };
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut first_default: Option<(String, String)> = None;
+        for account_id in &signed_in {
+            let Some(dir) = account_dir(&home, account_id) else {
+                tracing::debug!(
+                    target: "zeron_harness::aside",
+                    "skipping aside account with unparseable id"
+                );
+                continue;
+            };
+            let models_text = match tokio::fs::read_to_string(dir.join("models.json")).await {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "zeron_harness::aside",
+                        "skipping aside account with unreadable models.json: {error}"
+                    );
+                    continue;
+                }
+            };
+            let models_value: Value = match serde_json::from_str(&models_text) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!(
+                        target: "zeron_harness::aside",
+                        "skipping aside account with unparseable models.json: {error}"
+                    );
+                    continue;
+                }
+            };
+            for (provider, model_ids) in parse_models_catalog(&models_value) {
+                for model_id in model_ids {
+                    pairs.push((provider.clone(), model_id));
+                }
+            }
+            if first_default.is_none() {
+                match tokio::fs::read_to_string(dir.join("settings.json")).await {
+                    Ok(text) => match serde_json::from_str::<Value>(&text) {
+                        Ok(settings) => {
+                            if let Some(default) = parse_default_model(&settings) {
+                                first_default = Some(default);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                target: "zeron_harness::aside",
+                                "ignoring unparseable aside settings.json: {error}"
+                            );
+                        }
+                    },
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "zeron_harness::aside",
+                            "aside settings.json unreadable, continuing without default ordering: {error}"
+                        );
+                    }
+                }
+            }
+        }
+        if pairs.is_empty() {
+            return (Vec::new(), signed_in);
+        }
+        pairs.sort();
+        pairs.dedup();
+        let mut rows: Vec<Model> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        for (provider, model_id) in pairs {
+            let id = format!("{provider}/{model_id}");
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+            rows.push(discovered_row(&provider, &model_id));
+        }
+        if let Some((default_provider, default_model)) = first_default {
+            let default_id = format!("{default_provider}/{default_model}");
+            if let Some(index) = rows.iter().position(|row| row.id == default_id) {
+                if index != 0 {
+                    let row = rows.remove(index);
+                    rows.insert(0, row);
+                }
+            }
+        }
+        (rows, signed_in)
+    }
+
+    async fn resolved_global_args(&self, request: &RunRequest) -> Vec<String> {
+        match self.discover_accounts().await {
+            Some(ids) => Self::global_args_with_accounts(request, Some(&ids)),
+            None => Self::global_args(request),
+        }
     }
 
     async fn spawn_mcp(
@@ -225,7 +663,7 @@ impl AsideHarness {
     ) -> Result<(PathBuf, Child, RpcClient), HarnessError> {
         let executable = self.resolve_executable()?;
         let mut command = Command::new(&executable);
-        command.args(Self::global_args(request)).arg("mcp");
+        command.args(self.resolved_global_args(request).await).arg("mcp");
         crate::compose_child_path(&mut command, &executable);
         if !request.cwd.is_empty() {
             command.current_dir(&request.cwd);
@@ -275,7 +713,7 @@ impl AsideHarness {
     ) -> Result<std::process::ExitStatus, HarnessError> {
         let executable = self.resolve_executable()?;
         let mut command = Command::new(&executable);
-        command.args(Self::global_args(request));
+        command.args(self.resolved_global_args(request).await);
         command.args(["session", command_name, session_id]);
         if let Some(prompt) = prompt {
             command.arg(prompt);
@@ -341,7 +779,18 @@ impl Harness for AsideHarness {
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        // Codex-style live discovery per call with static fallback; failures
+        // are never cached so reopening the picker retries.
+        let (discovered, signed_in) = self.discover_catalog().await;
+        let mut catalog = static_models();
+        catalog.extend(discovered);
+        if !signed_in.is_empty() {
+            let option = account_option(&signed_in);
+            for model in &mut catalog {
+                model.options.push(option.clone());
+            }
+        }
+        Ok(catalog)
     }
 
     async fn run(
@@ -790,7 +1239,7 @@ mod tests {
             std::fs::write(exe, b"fake").unwrap();
         }
         let joined = |dirs: &[&std::path::Path]| std::env::join_paths(dirs).unwrap();
-        let mut values = HashMap::new();
+        let mut values: HashMap<String, OsString> = HashMap::new();
         values.insert("HOME".into(), OsString::from(home));
         values.insert("PATH".into(), joined(&[path_dir.clone().as_path()]));
         let env = |key: &str| values.get(key).cloned();
@@ -952,5 +1401,173 @@ mod tests {
                 "local"
             ]
         );
+    }
+
+    #[test]
+    fn account_list_parser_filters_signed_out_and_ignores_emails() {
+        let text = "\
+* u0  redacted  signed in  profiles: Profile 0
+provider: redacted
+  u1  redacted  signed out
+  u2  redacted  signed in  profiles: Profile 0
+not an account line
+";
+        assert_eq!(
+            parse_account_list(text),
+            vec![
+                ("u0".to_owned(), true),
+                ("u1".to_owned(), false),
+                ("u2".to_owned(), true),
+            ]
+        );
+        assert!(parse_account_list("").is_empty());
+        assert!(parse_account_list("provider: redacted\n").is_empty());
+    }
+
+    #[test]
+    fn catalog_parser_ignores_secret_adjacent_fields() {
+        let value = json!({
+            "providers": [
+                {
+                    "id": "fake-alpha",
+                    "apiKey": "FAKE-SECRET-DO-NOT-USE",
+                    "authHeader": "FAKE-SECRET-DO-NOT-USE",
+                    "baseUrl": "https://fake.example.invalid",
+                    "models": [
+                        {"id": "fake-alpha-model-b", "apiKey": "FAKE"},
+                        {"id": "fake-alpha-model-a", "displayName": "Fake A"},
+                        "fake-alpha-model-c"
+                    ]
+                },
+                {
+                    "name": "fake-beta",
+                    "apiKey": "FAKE-SECRET-DO-NOT-USE",
+                    "models": [
+                        {"modelId": "fake-beta-model-1"},
+                        {"model": "fake-beta-model-2"},
+                        {"name": "fake-beta-model-3"}
+                    ]
+                },
+                {"id": "fake-empty", "models": []},
+                {"models": [{"id": "orphan"}]}
+            ]
+        });
+        let catalog = parse_models_catalog(&value);
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0].0, "fake-alpha");
+        assert_eq!(
+            catalog[0].1,
+            vec![
+                "fake-alpha-model-b",
+                "fake-alpha-model-a",
+                "fake-alpha-model-c"
+            ]
+        );
+        assert_eq!(catalog[1].0, "fake-beta");
+        assert_eq!(
+            catalog[1].1,
+            vec![
+                "fake-beta-model-1",
+                "fake-beta-model-2",
+                "fake-beta-model-3"
+            ]
+        );
+    }
+
+    #[test]
+    fn default_model_parser_reads_only_provider_and_model() {
+        let value = json!({
+            "defaultModel": {
+                "provider": "fake-beta",
+                "modelId": "fake-beta-model-2",
+                "thinkingLevel": "whatever",
+                "fastMode": false
+            }
+        });
+        assert_eq!(
+            parse_default_model(&value),
+            Some(("fake-beta".to_owned(), "fake-beta-model-2".to_owned()))
+        );
+        assert_eq!(parse_default_model(&json!({})), None);
+        assert_eq!(
+            parse_default_model(&json!({"defaultModel": {"provider": "x"}})),
+            None
+        );
+    }
+
+    #[test]
+    fn account_dir_maps_u_prefix_to_digits() {
+        let home = std::path::Path::new("/tmp/fake-home");
+        assert_eq!(
+            account_dir(home, "u0"),
+            Some(home.join(".aside").join("u").join("0"))
+        );
+        assert_eq!(
+            account_dir(home, "u12"),
+            Some(home.join(".aside").join("u").join("12"))
+        );
+        assert_eq!(account_dir(home, "u"), None);
+        assert_eq!(account_dir(home, "ux"), None);
+        assert_eq!(account_dir(home, "0"), None);
+        assert_eq!(account_dir(home, ""), None);
+    }
+
+    #[test]
+    fn slash_model_uses_short_flag_and_suppresses_provider() {
+        let mut request = RunRequest {
+            prompt: "p".into(),
+            harness: None,
+            model: Some("fake-beta/fake-beta-model-1".into()),
+            reasoning: None,
+            model_options: Map::new(),
+            cwd: String::new(),
+            sandbox: zeron_proto::SandboxLevel::ReadOnly,
+            auto_approve: false,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        };
+        request
+            .model_options
+            .insert("provider".into(), "fake-beta".into());
+        request.model_options.insert("host".into(), "local".into());
+        assert_eq!(
+            AsideHarness::global_args(&request),
+            vec!["-m", "fake-beta/fake-beta-model-1", "--host", "local"]
+        );
+    }
+
+    #[test]
+    fn account_option_validates_membership_only_when_discovery_succeeded() {
+        let mut request = RunRequest {
+            prompt: "p".into(),
+            harness: None,
+            model: Some("default".into()),
+            reasoning: None,
+            model_options: Map::new(),
+            cwd: String::new(),
+            sandbox: zeron_proto::SandboxLevel::ReadOnly,
+            auto_approve: false,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+        };
+        request.model_options.insert("account".into(), "u0".into());
+        // No discovery (None): forward without validation, never hard-error.
+        assert!(AsideHarness::global_args(&request).contains(&"--account".to_owned()));
+        // Discovery succeeded with membership: forward.
+        assert!(AsideHarness::global_args_with_accounts(
+            &request,
+            Some(&["u0".to_owned(), "u2".to_owned()])
+        )
+        .contains(&"u0".to_owned()));
+        // Discovery succeeded without membership: skip, never hard-error.
+        let filtered = AsideHarness::global_args_with_accounts(&request, Some(&["u2".to_owned()]));
+        assert!(!filtered.contains(&"--account".to_owned()));
+        assert!(!filtered.contains(&"u0".to_owned()));
+        // Discovery succeeded with zero accounts: skip.
+        let empty =
+            AsideHarness::global_args_with_accounts(&request, Some(&[] as &[String]));
+        assert!(!empty.contains(&"--account".to_owned()));
     }
 }

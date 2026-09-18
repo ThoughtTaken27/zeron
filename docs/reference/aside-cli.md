@@ -86,15 +86,59 @@ transport and reports that limitation instead of guessing a session.
 
 ## Models and options
 
-Aside does not expose a stable public model-catalog API for this integration.
-The Zeron catalog is intentionally static and contains two routing entries:
+The Zeron catalog is dynamically imported from the user's real Aside config
+on every `models()` call (Codex-style live discovery, never cached), with a
+static `default`/`fast` fallback when discovery yields nothing:
 
 | ID | Label | Meaning |
 | --- | --- | --- |
 | `default` | Default | Aside's normal model routing |
 | `fast` | Fast | Aside's faster routing, which may use extra credit |
+| `<provider>/<model>` | `<model>` | Discovered row, described as `<provider> via Aside` |
 
-Both entries advertise the Zeron picker ladder from `off` through `max`. The complete CLI effort choices are:
+Sources (read-only, no writes, no network):
+
+- `aside account list` (10s timeout) for signed-in account ids only. There is
+  no `--json` flag; only the account id (`u` + digits) and the signed-in
+  boolean are parsed from each line — emails are redacted/ignored. Failure
+  (timeout, spawn error, non-zero exit) falls back to the static catalog with
+  a debug log; failures are never cached.
+- `~/.aside/u/{digits}/models.json` per signed-in account (`u0` -> `0`;
+  unparseable ids skipped). Only the top-level `providers` array (or map) is
+  read: provider `name`/`id` plus each model's id-ish keys
+  (`id`/`modelId`/`model`/`name`). Secret-adjacent fields (`apiKey`,
+  `authHeader`, `baseUrl`, …) are never read and file contents are never
+  logged. Missing/unparseable files skip that account with a debug log.
+- `~/.aside/u/{digits}/settings.json` `defaultModel { provider, modelId }`
+  (non-secret) is used ONLY to order the catalog: when it matches a
+  discovered row, that row moves to index 2 (right after `default`/`fast`).
+  No other semantics are inferred (`thinkingLevel`/`fastMode` ignored).
+
+Discovered rows are sorted by `(provider, model)`, deduplicated by
+`provider/model` id, and advertise the full Zeron picker ladder from `off`
+through `max` with the same `effort` + `permission` options as the static
+rows. Remote hosts are 403-blocked except `local`; no host discovery is
+performed — the existing host passthrough is unchanged.
+
+Account routing: every row (static + discovered) gains an `account` picker
+option ONLY when at least one signed-in account is discovered. Its choices
+are the signed-in ids with the first as default; with zero discovered the
+option is omitted entirely (as before). At spawn, `model_options["account"]`
+is forwarded as `--account <id>`; membership is validated against that call's
+freshly discovered ids and unknown values are skipped with a debug log —
+never a hard error. When discovery fails, the value forwards unvalidated
+rather than breaking the run.
+
+Model routing for discovered rows: when `request.model` contains `/`, the
+spawn passes `-m <provider/model>` (slash form overrides `--provider`, so
+`-p` is not also sent). `default`/`fast`/other behavior is unchanged
+(`--speed fast`, `--model <id>`, `--effort`, `--permission`, `--provider`,
+`--host`, `--account`).
+
+The iOS peer is untouched: the wire delivers the live catalog there and its
+fallback stays `default`/`fast`.
+
+All entries advertise the Zeron picker ladder from `off` through `max`. The complete CLI effort choices are:
 
 ```text
 off, minimal, low, medium, high, xhigh, max, ultrabrowse
@@ -105,15 +149,17 @@ while the shared reasoning ladder includes `off` through `max`. The `effort`
 option also includes `default`, with `default` as its default choice.
 
 The `permission` option uses `ask`, `guard`, and `full-access`, with `guard` as
-the default. Provider names and host names are not static picker choices:
-they are account- and device-specific strings, so the iOS catalog does not
-pretend to enumerate them.
+the default. Host names are not picker choices: they are device-specific
+strings passed through untouched. Provider/model combinations appear as
+discovered `<provider>/<model>` rows, and signed-in account ids appear as an
+`account` picker option whenever discovery finds at least one.
 
 The CLI still accepts explicit model/provider selections such as
-`--model openai/gpt-5.6-sol` and `--provider openai`. Zeron does not validate
-those values against a dynamic catalog, and built-in Aside models require an
-active Aside sign-in. Configure provider credentials in Aside rather than in
-Zeron.
+`-m fake-provider/fake-model` and `--provider fake-provider`. Discovered `provider/model`
+rows route via `-m`; the `account` choice is validated against the run's fresh
+discovery (unknown values skipped, never a hard error). Built-in Aside models
+require an active Aside sign-in. Configure provider credentials in Aside
+rather than in Zeron.
 
 ## Remote hosts
 
