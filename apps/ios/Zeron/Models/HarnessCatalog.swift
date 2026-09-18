@@ -93,6 +93,9 @@ enum HarnessCatalog {
     /// Aside's static fallback mirrors aside::static_models. The route is the
     /// model id; effort and permission are explicit options because the
     /// public CLI exposes them, while provider/host values remain dynamic.
+    /// No reasoning ladder (empty, like the Devin/Hermes rows): the `effort`
+    /// option is the single thinking knob, so the Reasoning row stays hidden
+    /// and `defaultReasoning` returns nil for these rows.
     private static let asideEffortOption = ModelOptionInfo(
         id: "effort", label: "Thinking Effort", choices: [
             ModelOptionChoiceInfo(id: "default", label: "Default"),
@@ -111,9 +114,6 @@ enum HarnessCatalog {
             ModelOptionChoiceInfo(id: "guard", label: "Guard"),
             ModelOptionChoiceInfo(id: "full-access", label: "Full Access"),
         ], defaultChoice: "guard")
-    private static let asideReasoningLadder = [
-        "off", "minimal", "low", "medium", "high", "xhigh", "max",
-    ]
 
     static func models(for harness: String) -> [ModelInfo] {
         switch harness {
@@ -175,11 +175,11 @@ enum HarnessCatalog {
             return [
                 ModelInfo(id: "default", label: "Default",
                           description: "Aside's default model routing",
-                          reasoningLevels: asideReasoningLadder,
+                          reasoningLevels: [],
                           options: [asideEffortOption, asidePermissionOption]),
                 ModelInfo(id: "fast", label: "Fast",
                           description: "Aside's fast model routing",
-                          reasoningLevels: asideReasoningLadder,
+                          reasoningLevels: [],
                           options: [asideEffortOption, asidePermissionOption]),
             ]
         case "codex":

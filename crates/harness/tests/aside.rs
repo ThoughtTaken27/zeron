@@ -138,9 +138,17 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
             .collect::<Vec<_>>(),
         vec!["default", "fast"]
     );
+    // Static fallback rows carry no reasoning ladder (single `effort` knob).
+    assert!(
+        models
+            .iter()
+            .all(|model| model.reasoning_levels.is_empty())
+    );
 
     set_env("ASIDE_FAKE_SCENARIO", "happy");
     let mut happy = request("open the page");
+    // A stored reasoning level must not error and must not drive --effort
+    // (the `effort` option is the single knob); it is ignored end to end.
     happy.reasoning = Some(zeron_proto::ReasoningLevel::High);
     happy
         .model_options
@@ -151,6 +159,25 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     happy.model_options.insert("host".into(), "local".into());
     let (controls, _steer, _interrupt) = make_controls();
     let events = run_to_end(&harness, happy, controls).await;
+    // SessionStarted is the FIRST event and carries the fixture id, so the
+    // engine can record the resume id; the embedded session_id line never
+    // leaks into chat text or the terminal result.
+    assert!(
+        matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-happy"),
+        "{events:?}"
+    );
+    for event in &events {
+        match event {
+            AgentEvent::TextDelta { text } => {
+                assert!(!text.contains("session_id:"), "{text}")
+            }
+            AgentEvent::Done {
+                result: Some(result),
+                ..
+            } => assert!(!result.contains("session_id:"), "{result}"),
+            _ => {}
+        }
+    }
     assert!(
         events
             .iter()
@@ -161,13 +188,38 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     set_env("ASIDE_FAKE_SCENARIO", "error");
     let (error_controls, _steer, _interrupt) = make_controls();
     let events = run_to_end(&harness, request("fail"), error_controls).await;
-    assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), .. } if error == "agent failed")));
+    assert!(
+        matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-error"),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), session_id: Some(id), .. } if error == "agent failed" && id == "ses-error")));
 
     set_env("ASIDE_FAKE_SCENARIO", "resume");
     let mut follow_up = request("continue");
     follow_up.resume = Some("ses-happy".into());
     let (resume_controls, _steer, _interrupt) = make_controls();
     let events = run_to_end(&harness, follow_up, resume_controls).await;
+    assert!(
+        matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-resumed"),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "follow-up complete"))
+    );
+    for event in &events {
+        match event {
+            AgentEvent::TextDelta { text } => {
+                assert!(!text.contains("session_id:"), "{text}")
+            }
+            AgentEvent::Done {
+                result: Some(result),
+                ..
+            } => assert!(!result.contains("session_id:"), "{result}"),
+            _ => {}
+        }
+    }
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Completed, session_id: Some(id), .. } if id == "ses-resumed")));
 
     set_env("ASIDE_FAKE_SCENARIO", "hold");
@@ -202,9 +254,11 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Interrupted, session_id: Some(id), .. } if id == "ses-live")));
 
     let calls = std::fs::read_to_string(log).unwrap();
+    // Stored reasoning is ignored: no --effort flag from it (the `effort`
+    // option is the single knob).
     assert!(
         calls.contains(
-            "--speed fast --effort high --permission full-access --provider openai --host local mcp"
+            "--speed fast --permission full-access --provider openai --host local mcp"
         ),
         "{calls}"
     );
@@ -344,11 +398,13 @@ async fn dynamic_catalog_imports_models_orders_default_and_routes_account() {
             "fake-beta/fake-model-1",
         ]
     );
-    // Discovered rows carry provider-via description + full ladder + options.
+    // Discovered rows carry provider-via description + options, and NO
+    // reasoning ladder (the `effort` option is the single thinking knob, so
+    // the Reasoning row stays hidden).
     for model in &models[2..] {
         assert_eq!(model.label.as_str(), model.id.split('/').nth(1).unwrap());
         assert!(model.description.as_deref().unwrap().ends_with(" via Aside"));
-        assert!(model.reasoning_levels.contains(&zeron_proto::ReasoningLevel::Max));
+        assert!(model.reasoning_levels.is_empty(), "{}", model.id);
         assert!(model.options.iter().any(|o| o.id == "effort"));
         assert!(model.options.iter().any(|o| o.id == "permission"));
     }

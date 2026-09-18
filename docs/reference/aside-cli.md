@@ -84,6 +84,13 @@ Consequently, in-turn steering is available for a resumed or previously
 persisted Aside session; the first-ever turn cannot be steered through this
 transport and reports that limitation instead of guessing a session.
 
+The id arrives embedded as the first line of the exec result text
+(`session_id: <id>`, blank line, reply body) — there is no separate
+structured session-id field. Zeron parses that line exactly, strips it from
+the visible reply, emits `SessionStarted` first so the engine records the
+resume id, and reports a loud error (never a silent new session) when neither
+a parsed id nor a resumed session exists.
+
 ## Models and options
 
 The Zeron catalog is dynamically imported from the user's real Aside config
@@ -115,8 +122,8 @@ Sources (read-only, no writes, no network):
   No other semantics are inferred (`thinkingLevel`/`fastMode` ignored).
 
 Discovered rows are sorted by `(provider, model)`, deduplicated by
-`provider/model` id, and advertise the full Zeron picker ladder from `off`
-through `max` with the same `effort` + `permission` options as the static
+`provider/model` id, and advertise no reasoning ladder (empty, like the
+static rows) with the same `effort` + `permission` options as the static
 rows. Remote hosts are 403-blocked except `local`; no host discovery is
 performed — the existing host passthrough is unchanged.
 
@@ -135,18 +142,22 @@ spawn passes `-m <provider/model>` (slash form overrides `--provider`, so
 (`--speed fast`, `--model <id>`, `--effort`, `--permission`, `--provider`,
 `--host`, `--account`).
 
-The iOS peer is untouched: the wire delivers the live catalog there and its
-fallback stays `default`/`fast`.
+The iOS peer's fallback mirrors this catalog: `default`/`fast` with no
+reasoning ladder; the wire delivers the live catalog there.
 
-All entries advertise the Zeron picker ladder from `off` through `max`. The complete CLI effort choices are:
+No entry advertises a Reasoning ladder, so the picker's Reasoning row stays
+hidden for Aside. Thinking strength is driven by the single explicit `effort`
+option (a stored Reasoning level from an older chat is ignored, never an
+error). The complete CLI effort choices are:
 
 ```text
 off, minimal, low, medium, high, xhigh, max, ultrabrowse
 ```
 
-The `ultrabrowse` choice is represented through the explicit `effort` option,
-while the shared reasoning ladder includes `off` through `max`. The `effort`
-option also includes `default`, with `default` as its default choice.
+The `ultrabrowse` choice is representable only through the `effort` option
+(it has no ReasoningLevel equivalent), which is why `effort` is the surviving
+knob. The `effort` option also includes `default`, with `default` as its
+default choice; `default` omits `--effort` so Aside decides.
 
 The `permission` option uses `ask`, `guard`, and `full-access`, with `guard` as
 the default. Host names are not picker choices: they are device-specific

@@ -625,21 +625,16 @@ pub fn default_registry() -> HarnessRegistry {
     // Aside is macOS-first and accepts the documented in-turn `session steer`
     // command. Keep the descriptor in the catalog even when the CLI is absent so Settings can
     // show the install guidance; both probing and construction remain lazy.
+    // No reasoning ladder (must mirror AsideHarness exactly — the
+    // descriptor-stability rule): the `effort` model option is the single
+    // thinking knob, so the Reasoning row stays hidden.
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Aside,
             name: "Aside".into(),
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Off,
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ],
+            reasoning_levels: Vec::new(),
             installed: true,
             enabled: None,
         },
@@ -804,18 +799,9 @@ mod tests {
         assert_eq!(aside.id(), HarnessId::Aside);
         assert_eq!(aside.display_name(), "Aside");
         assert_eq!(aside.steering_mode(), SteeringMode::StepBoundary);
-        assert_eq!(
-            aside.reasoning_levels(),
-            &[
-                ReasoningLevel::Off,
-                ReasoningLevel::Minimal,
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max,
-            ]
-        );
+        // No reasoning ladder: the `effort` model option is the single
+        // thinking knob (mirrors the Aside descriptor above).
+        assert!(aside.reasoning_levels().is_empty());
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`

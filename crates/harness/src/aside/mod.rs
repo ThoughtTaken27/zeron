@@ -78,15 +78,12 @@ pub fn static_models() -> Vec<Model> {
         id: id.into(),
         label: label.into(),
         description: Some(description.into()),
-        reasoning_levels: vec![
-            ReasoningLevel::Off,
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
+        // No reasoning ladder: effort is driven by the single explicit
+        // `effort` model option below (Cursor-style — an empty ladder keeps
+        // the picker's Reasoning row hidden). `ultrabrowse` exists only as
+        // an effort choice and is unrepresentable in ReasoningLevel, which
+        // is why `effort` is the surviving knob.
+        reasoning_levels: vec![],
         options: vec![effort_option(), permission_option()],
     })
     .collect()
@@ -365,24 +362,14 @@ fn account_dir(home: &Path, account_id: &str) -> Option<PathBuf> {
     Some(home.join(".aside").join("u").join(digits))
 }
 
-fn full_reasoning_ladder() -> Vec<ReasoningLevel> {
-    vec![
-        ReasoningLevel::Off,
-        ReasoningLevel::Minimal,
-        ReasoningLevel::Low,
-        ReasoningLevel::Medium,
-        ReasoningLevel::High,
-        ReasoningLevel::XHigh,
-        ReasoningLevel::Max,
-    ]
-}
-
 fn discovered_row(provider: &str, display: &str, model_id: &str) -> Model {
     Model {
         id: format!("{provider}/{model_id}"),
         label: model_id.into(),
         description: Some(format!("{display} via Aside")),
-        reasoning_levels: full_reasoning_ladder(),
+        // Empty ladder mirrors static_models: the `effort` option is the
+        // single thinking knob, so the Reasoning row stays hidden.
+        reasoning_levels: vec![],
         options: vec![effort_option(), permission_option()],
     }
 }
@@ -482,9 +469,12 @@ impl AsideHarness {
         };
         if let Some(effort) = option("effort").filter(|value| *value != "default") {
             args.extend(["--effort".into(), effort.into()]);
-        } else if let Some(reasoning) = request.reasoning.and_then(reasoning_flag) {
-            args.extend(["--effort".into(), reasoning.into()]);
         }
+        // NOTE: `request.reasoning` is deliberately ignored here. It drove
+        // the same `--effort` flag as the `effort` option (one knob, two
+        // dropdowns), so the `effort` option is the single survivor; chats
+        // stored with a reasoning level keep running, they just don't emit
+        // `--effort` from it anymore.
         if let Some(permission) = option("permission") {
             args.extend(["--permission".into(), permission.into()]);
         }
@@ -810,15 +800,9 @@ impl Harness for AsideHarness {
     }
 
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        const LEVELS: &[ReasoningLevel] = &[
-            ReasoningLevel::Off,
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ];
+        // Empty: the `effort` model option is the single thinking knob, so
+        // the picker's Reasoning row stays hidden (Cursor precedent).
+        const LEVELS: &[ReasoningLevel] = &[];
         LEVELS
     }
 
@@ -946,7 +930,7 @@ async fn run_session(session: AsideSession) {
         ])),
     ));
     let mut interrupted = false;
-    let mut interrupted_session_id = request.resume.clone();
+    let interrupted_session_id = request.resume.clone();
     // Aside MCP does not provide a message id in its public result contract;
     // mint one per Zeron turn so separate chats and follow-ups cannot collide
     // in the engine's transcript deduplication.
@@ -1019,37 +1003,58 @@ async fn run_session(session: AsideSession) {
 
     match response {
         Some(Ok(result)) => {
-            let mapped =
-                map_completed_result(&result, request.resume.as_deref(), &assistant_message_id);
-            interrupted_session_id = mapped.session_id.clone();
-            if !mapped
-                .events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::SessionStarted { .. }))
-            {
+            let mapped = map_completed_result(&result, request.resume.as_deref());
+            let Some(session_id) = mapped.session_id.clone() else {
+                // Loud failure, never a silent new session: without an id the
+                // engine could record no resume and every follow-up would
+                // start over. No ids are ever synthesized or stored here.
+                emit_done(
+                    &event_tx,
+                    DoneStatus::Errored,
+                    None,
+                    mapped.error,
+                    None,
+                )
+                .await;
+                shutdown_child(&mut child, kill_grace).await;
+                return;
+            };
+            // SessionStarted FIRST: the engine records the resume id from it
+            // (and from the terminal Done), so it must precede everything and
+            // always carry the parsed id. The pre-completion in-memory id
+            // above stays `request.resume`: it is only ever used to
+            // steer/stop a resumed session while its turn is still in flight.
+            let _ = event_tx
+                .send(Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Aside,
+                    model: request
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| DEFAULT_MODEL.into()),
+                    tools: Vec::new(),
+                    cwd: request.cwd.clone(),
+                    session_id: session_id.clone(),
+                    assistant_message_id: assistant_message_id.clone(),
+                }))
+                .await;
+            if mapped.status == DoneStatus::Completed && !mapped.visible.is_empty() {
                 let _ = event_tx
-                    .send(Ok(AgentEvent::SessionStarted {
-                        harness: HarnessId::Aside,
-                        model: request
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_MODEL.into()),
-                        tools: Vec::new(),
-                        cwd: request.cwd.clone(),
-                        session_id: mapped.session_id.clone().unwrap_or_default(),
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: mapped.visible.clone(),
+                    }))
+                    .await;
+                let _ = event_tx
+                    .send(Ok(AgentEvent::AssistantMessageCompleted {
                         assistant_message_id: assistant_message_id.clone(),
                     }))
                     .await;
-            }
-            for event in mapped.events {
-                let _ = event_tx.send(Ok(event)).await;
             }
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: mapped.status,
                     result: mapped.result,
                     error: mapped.error,
-                    session_id: mapped.session_id,
+                    session_id: Some(session_id),
                 }))
                 .await;
         }
@@ -1078,156 +1083,108 @@ async fn run_session(session: AsideSession) {
 }
 
 struct MappedResult {
-    events: Vec<AgentEvent>,
     status: DoneStatus,
+    /// Visible reply body with the `session_id` line stripped (or the whole
+    /// wire text when no session line was present). May be empty.
+    visible: String,
+    /// Short completed text for the terminal event (never a dump). `None`
+    /// when there is nothing visible or the turn errored.
     result: Option<String>,
     error: Option<String>,
     session_id: Option<String>,
 }
 
-fn map_completed_result(
-    response: &Value,
-    fallback_session_id: Option<&str>,
-    assistant_message_id: &str,
-) -> MappedResult {
-    let structured = response
-        .get("structuredContent")
-        .filter(|value| value.is_object())
-        .cloned()
-        .or_else(|| content_json(response))
-        .unwrap_or_else(|| response.clone());
-    let session_id = find_string(&[&structured, response], &["session_id", "sessionId"])
-        .or_else(|| fallback_session_id.map(str::to_owned));
-    let status = find_string(&[&structured, response], &["status"]);
-    let tool_error = response.get("isError").and_then(Value::as_bool) == Some(true)
-        || structured.get("isError").and_then(Value::as_bool) == Some(true)
-        || has_nonempty_key(&structured, "error")
-        || has_nonempty_key(response, "error")
-        || matches!(
-            status.as_deref(),
-            Some("error" | "errored" | "failed" | "failure")
-        );
-    let error = find_string(&[&structured, response], &["error", "message"]);
-    let result_text = find_string(
-        &[&structured, response],
-        &["result", "output", "answer", "text"],
-    )
-    .or_else(|| content_text(response));
-
-    if tool_error || error.is_some() && result_text.is_none() {
+/// Map a completed `exec` result.
+///
+/// Wire shape (only shape): `{"result":{"content":[{"type":"text",
+/// `"text":"session_id: <id>\n\n<reply>"}],"isError":false}}`. The session
+/// id is EMBEDDED as the text's first line — there is no separate structured
+/// session-id field — so it is parsed exactly, never sniffed. `isError` is
+/// the only error signal; `structuredContent` and any `events` arrays are
+/// fiction and are not read.
+fn map_completed_result(response: &Value, fallback_session_id: Option<&str>) -> MappedResult {
+    let raw = wire_text(response).unwrap_or("");
+    let (parsed_id, visible) = match parse_session_reply(raw) {
+        Some((id, body)) => (Some(id), body),
+        // Unparseable text carries no session line, so the whole text is the
+        // visible body; the id falls back to the resumed session when one
+        // exists. Ids are never synthesized.
+        None => (None, raw.to_owned()),
+    };
+    let session_id = parsed_id.or_else(|| fallback_session_id.map(str::to_owned));
+    if is_tool_error(response) {
+        let error = if visible.trim().is_empty() {
+            "Aside MCP execution failed".to_owned()
+        } else {
+            visible.clone()
+        };
         return MappedResult {
-            events: Vec::new(),
             status: DoneStatus::Errored,
+            visible,
             result: None,
-            error: error
-                .or(result_text)
-                .or_else(|| Some("Aside MCP execution failed".into())),
+            error: Some(error),
             session_id,
         };
     }
-
-    let mut events = Vec::new();
-    if let Some(event_values) = structured.get("events").and_then(Value::as_array) {
-        for value in event_values {
-            if let Ok(event) = serde_json::from_value::<AgentEvent>(value.clone()) {
-                events.push(event);
-            }
-        }
-    }
-    // The outer MCP response is authoritative for completion, so avoid
-    // emitting a second terminal event if a future CLI includes one in events.
-    events.retain(|event| !matches!(event, AgentEvent::Done { .. }));
-    if events.is_empty() {
-        if let Some(text) = result_text.clone().filter(|text| !text.is_empty()) {
-            events.push(AgentEvent::TextDelta { text });
-            events.push(AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: assistant_message_id.into(),
-            });
-        }
-    }
+    let Some(session_id) = session_id else {
+        return MappedResult {
+            status: DoneStatus::Errored,
+            visible,
+            result: None,
+            error: Some(
+                "Aside MCP response had no session id (expected first line `session_id: <id>`)".into(),
+            ),
+            session_id: None,
+        };
+    };
     MappedResult {
-        events,
+        result: (!visible.is_empty()).then(|| visible.clone()),
         status: DoneStatus::Completed,
-        result: result_text,
+        visible,
         error: None,
-        session_id,
+        session_id: Some(session_id),
     }
 }
 
-fn find_string(values: &[&Value], keys: &[&str]) -> Option<String> {
-    values
-        .iter()
-        .find_map(|value| find_string_recursive(value, keys))
-}
-
-fn has_nonempty_key(value: &Value, key: &str) -> bool {
-    if let Some(object) = value.as_object() {
-        if object
-            .get(key)
-            .and_then(Value::as_str)
-            .is_some_and(|text| !text.is_empty())
-        {
-            return true;
-        }
-        return object.values().any(|child| has_nonempty_key(child, key));
+/// Parse `session_id: <id>\n\n<body>`.
+///
+/// The first line must be exactly `session_id:` plus a single non-space id
+/// (a trailing `\r` is tolerated). The body is everything after exactly one
+/// blank-line separator, preserved byte-identically except for trimmed
+/// trailing whitespace. Returns `None` when the first line is not a session
+/// line.
+fn parse_session_reply(text: &str) -> Option<(String, String)> {
+    let (first, rest) = match text.split_once('\n') {
+        Some((first, rest)) => (first, rest),
+        None => (text, ""),
+    };
+    let first = first.strip_suffix('\r').unwrap_or(first);
+    let id = first.strip_prefix("session_id:")?.trim();
+    if id.is_empty() || id.chars().any(char::is_whitespace) {
+        return None;
     }
-    value
-        .as_array()
-        .is_some_and(|array| array.iter().any(|child| has_nonempty_key(child, key)))
+    // `rest` starts right after the first line's newline; strip exactly one
+    // blank-line separator so further leading blank lines that belong to the
+    // reply body survive.
+    let body = rest
+        .strip_prefix("\r\n")
+        .or_else(|| rest.strip_prefix('\n'))
+        .or_else(|| rest.strip_prefix('\r'))
+        .unwrap_or(rest);
+    Some((id.to_owned(), body.trim_end().to_owned()))
 }
 
-fn find_string_recursive(value: &Value, keys: &[&str]) -> Option<String> {
-    if let Some(object) = value.as_object() {
-        for key in keys {
-            if let Some(text) = object
-                .get(*key)
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
-                return Some(text.to_owned());
-            }
-        }
-        for child in object.values() {
-            if let Some(found) = find_string_recursive(child, keys) {
-                return Some(found);
-            }
-        }
-    } else if let Some(array) = value.as_array() {
-        for child in array {
-            if let Some(found) = find_string_recursive(child, keys) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
-fn content_json(response: &Value) -> Option<Value> {
+/// The explicit wire text: the first `content[]` text item.
+fn wire_text(response: &Value) -> Option<&str> {
     response
-        .get("content")
-        .and_then(Value::as_array)
-        .and_then(|items| {
-            items.iter().find_map(|item| {
-                item.get("text")
-                    .and_then(Value::as_str)
-                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
-                    .filter(Value::is_object)
-            })
-        })
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find_map(|item| item.get("text")?.as_str())
 }
 
-fn content_text(response: &Value) -> Option<String> {
-    let content = response.get("content")?.as_array()?;
-    let mut text = String::new();
-    for item in content {
-        if let Some(value) = item.get("text").and_then(Value::as_str) {
-            if !text.is_empty() {
-                text.push('\n');
-            }
-            text.push_str(value);
-        }
-    }
-    (!text.is_empty()).then_some(text)
+fn is_tool_error(response: &Value) -> bool {
+    response.get("isError").and_then(Value::as_bool) == Some(true)
 }
 
 fn option_string(value: &Value) -> Option<&str> {
@@ -1235,19 +1192,6 @@ fn option_string(value: &Value) -> Option<&str> {
         value
             .as_bool()
             .map(|value| if value { "true" } else { "false" })
-    })
-}
-
-fn reasoning_flag(level: ReasoningLevel) -> Option<&'static str> {
-    Some(match level {
-        ReasoningLevel::Off => return None,
-        ReasoningLevel::Minimal => "minimal",
-        ReasoningLevel::Low => "low",
-        ReasoningLevel::Medium => "medium",
-        ReasoningLevel::High => "high",
-        ReasoningLevel::XHigh | ReasoningLevel::Ultracode => "xhigh",
-        ReasoningLevel::Max | ReasoningLevel::Ultra => "max",
-        ReasoningLevel::Ultrathink => return None,
     })
 }
 
@@ -1345,49 +1289,98 @@ mod tests {
     }
 
     #[test]
-    fn maps_structured_completion_and_preserves_session_id() {
+    fn parses_embedded_session_id_and_strips_it_from_visible_text() {
         let mapped = map_completed_result(
             &json!({
-                "structuredContent": {"session_id": "ses-1", "result": "finished"},
-                "content": [{"type": "text", "text": "finished"}]
+                "content": [{"type": "text", "text": "session_id: ses-1\n\nfinished"}],
+                "isError": false,
             }),
             None,
-            "aside-test-message",
         );
         assert_eq!(mapped.session_id.as_deref(), Some("ses-1"));
         assert_eq!(mapped.status, DoneStatus::Completed);
+        assert_eq!(mapped.visible, "finished");
         assert_eq!(mapped.result.as_deref(), Some("finished"));
-        assert!(
-            matches!(mapped.events.first(), Some(AgentEvent::TextDelta { text }) if text == "finished")
+        assert_eq!(mapped.error, None);
+    }
+
+    #[test]
+    fn session_reply_parsing_preserves_body_bytes() {
+        // Exactly one blank-line separator is stripped; further leading blank
+        // lines and interior bytes survive, trailing whitespace is trimmed.
+        assert_eq!(
+            parse_session_reply("session_id: ses-1\n\nline one\n\nline two  \n"),
+            Some(("ses-1".into(), "line one\n\nline two".into()))
+        );
+        assert_eq!(
+            parse_session_reply("session_id: ses-1\r\n\r\nbody\r\n"),
+            Some(("ses-1".into(), "body".into()))
+        );
+        assert_eq!(
+            parse_session_reply("session_id: ses-1\n\n\nkept blank"),
+            Some(("ses-1".into(), "\nkept blank".into()))
+        );
+        // No session line, empty id, or spaced id: unparseable, never guessed.
+        assert_eq!(parse_session_reply("just a reply"), None);
+        assert_eq!(parse_session_reply("session_id: \n\nbody"), None);
+        assert_eq!(parse_session_reply("session_id: two words\n\nbody"), None);
+        assert_eq!(parse_session_reply(""), None);
+    }
+
+    #[test]
+    fn unparseable_text_falls_back_to_resume_id_but_never_invents_one() {
+        let mapped = map_completed_result(
+            &json!({
+                "content": [{"type": "text", "text": "plain reply, no session line"}],
+                "isError": false,
+            }),
+            Some("ses-2"),
+        );
+        assert_eq!(mapped.session_id.as_deref(), Some("ses-2"));
+        assert_eq!(mapped.status, DoneStatus::Completed);
+        assert_eq!(mapped.visible, "plain reply, no session line");
+        assert_eq!(
+            mapped.result.as_deref(),
+            Some("plain reply, no session line")
         );
     }
 
     #[test]
-    fn maps_json_encoded_completion_from_mcp_text_content() {
+    fn missing_id_without_resume_errors_loudly() {
         let mapped = map_completed_result(
             &json!({
-                "content": [{
-                    "type": "text",
-                    "text": "{\"sessionId\":\"ses-json\",\"result\":\"json result\"}"
-                }]
+                "content": [{"type": "text", "text": "plain reply, no session line"}],
+                "isError": false,
             }),
             None,
-            "aside-test-message",
         );
-        assert_eq!(mapped.session_id.as_deref(), Some("ses-json"));
-        assert_eq!(mapped.result.as_deref(), Some("json result"));
+        assert_eq!(mapped.status, DoneStatus::Errored);
+        assert_eq!(mapped.session_id, None);
+        assert!(
+            mapped
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no session id")),
+            "{:?}",
+            mapped.error
+        );
     }
 
     #[test]
     fn maps_mcp_tool_error() {
         let mapped = map_completed_result(
-            &json!({"isError": true, "content": [{"type": "text", "text": "not running"}]}),
-            Some("ses-2"),
-            "aside-test-message",
+            &json!({
+                "isError": true,
+                "content": [{"type": "text", "text": "session_id: ses-2\n\nnot running"}]
+            }),
+            Some("ses-resume"),
         );
         assert_eq!(mapped.status, DoneStatus::Errored);
+        // The parsed id wins over the resume fallback, and the session line
+        // never leaks into the error text.
         assert_eq!(mapped.session_id.as_deref(), Some("ses-2"));
         assert_eq!(mapped.error.as_deref(), Some("not running"));
+        assert_eq!(mapped.result, None);
     }
 
     #[test]
@@ -1399,6 +1392,13 @@ mod tests {
                 .map(|model| model.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["default", "fast"]
+        );
+        // No reasoning ladder anywhere: the `effort` option is the single
+        // thinking knob, so the picker's Reasoning row stays hidden.
+        assert!(
+            models
+                .iter()
+                .all(|model| model.reasoning_levels.is_empty())
         );
         assert!(
             models
@@ -1419,11 +1419,13 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_and_explicit_options_map_to_documented_flags() {
+    fn stored_reasoning_is_ignored_while_effort_option_drives_flag() {
         let mut request = RunRequest {
             prompt: "p".into(),
             harness: None,
             model: Some("fast".into()),
+            // A chat stored with a reasoning level must not error and must
+            // not emit --effort: the `effort` option is the single knob.
             reasoning: Some(ReasoningLevel::High),
             model_options: Map::new(),
             cwd: String::new(),
@@ -1445,8 +1447,6 @@ mod tests {
             vec![
                 "--speed",
                 "fast",
-                "--effort",
-                "high",
                 "--permission",
                 "full-access",
                 "--provider",
@@ -1454,6 +1454,24 @@ mod tests {
                 "--host",
                 "local"
             ]
+        );
+        // The explicit `effort` option still drives the flag; "default"
+        // omits it so Aside decides.
+        request
+            .model_options
+            .insert("effort".into(), "high".into());
+        assert!(
+            AsideHarness::global_args(&request)
+                .windows(2)
+                .any(|pair| pair == ["--effort", "high"])
+        );
+        request
+            .model_options
+            .insert("effort".into(), "default".into());
+        assert!(
+            !AsideHarness::global_args(&request)
+                .iter()
+                .any(|arg| arg == "--effort")
         );
     }
 

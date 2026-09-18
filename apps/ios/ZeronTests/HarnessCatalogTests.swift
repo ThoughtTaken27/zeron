@@ -19,8 +19,9 @@ final class HarnessCatalogTests: XCTestCase {
         XCTAssertEqual(HarnessCatalog.models(for: "aside").map(\.id), ["default", "fast"])
 
         for model in HarnessCatalog.models(for: "aside") {
-            XCTAssertEqual(model.reasoningLevels,
-                           ["off", "minimal", "low", "medium", "high", "xhigh", "max"])
+            // No reasoning ladder: the `effort` option is the single thinking
+            // knob, so the Reasoning row stays hidden (mirrors the Rust rows).
+            XCTAssertTrue(model.reasoningLevels.isEmpty, "\(model.id)")
             XCTAssertEqual(model.options.map(\.id), ["effort", "permission"])
         }
 
