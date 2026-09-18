@@ -145,6 +145,31 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
             .all(|model| model.reasoning_levels.is_empty())
     );
 
+    // No session-id marker may ever leak into chat text or results — neither
+    // the old MCP shape nor the CLI stderr shape, nor raw ANSI escapes.
+    fn assert_no_leakage(events: &[AgentEvent]) {
+        for event in events {
+            match event {
+                AgentEvent::TextDelta { text } => {
+                    assert!(!text.contains("session_id:"), "{text}");
+                    assert!(!text.contains("created new session"), "{text}");
+                    assert!(!text.contains("continuing existing session"), "{text}");
+                    assert!(!text.contains('\x1b'), "{text:?}");
+                }
+                AgentEvent::Done {
+                    result: Some(result),
+                    ..
+                } => {
+                    assert!(!result.contains("session_id:"), "{result}");
+                    assert!(!result.contains("created new session"), "{result}");
+                    assert!(!result.contains("continuing existing session"), "{result}");
+                    assert!(!result.contains('\x1b'), "{result:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
     set_env("ASIDE_FAKE_SCENARIO", "happy");
     let mut happy = request("open the page");
     // A stored reasoning level must not error and must not drive --effort
@@ -160,24 +185,13 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     let (controls, _steer, _interrupt) = make_controls();
     let events = run_to_end(&harness, happy, controls).await;
     // SessionStarted is the FIRST event and carries the fixture id, so the
-    // engine can record the resume id; the embedded session_id line never
-    // leaks into chat text or the terminal result.
+    // engine can record the resume id; the stderr session line never leaks
+    // into chat text or the terminal result.
     assert!(
         matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-happy"),
         "{events:?}"
     );
-    for event in &events {
-        match event {
-            AgentEvent::TextDelta { text } => {
-                assert!(!text.contains("session_id:"), "{text}")
-            }
-            AgentEvent::Done {
-                result: Some(result),
-                ..
-            } => assert!(!result.contains("session_id:"), "{result}"),
-            _ => {}
-        }
-    }
+    assert_no_leakage(&events);
     assert!(
         events
             .iter()
@@ -185,14 +199,38 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     );
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Completed, session_id: Some(id), .. } if id == "ses-happy")));
 
-    set_env("ASIDE_FAKE_SCENARIO", "error");
-    let (error_controls, _steer, _interrupt) = make_controls();
-    let events = run_to_end(&harness, request("fail"), error_controls).await;
+    // Slash-model routing is REAL on the exec argv: `-m provider/model`.
+    set_env("ASIDE_FAKE_SCENARIO", "happy");
+    let mut slash = request("slash routed");
+    slash.model = Some("openai-codex/fake-codex-model-1".into());
+    let (slash_controls, _steer, _interrupt) = make_controls();
+    let events = run_to_end(&harness, slash, slash_controls).await;
     assert!(
-        matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-error"),
+        matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-happy"),
         "{events:?}"
     );
-    assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), session_id: Some(id), .. } if error == "agent failed" && id == "ses-error")));
+    assert_no_leakage(&events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "finished"))
+    );
+
+    // ANSI-wrapped stdout/stderr are stripped before parsing and display.
+    set_env("ASIDE_FAKE_SCENARIO", "ansi");
+    let (ansi_controls, _steer, _interrupt) = make_controls();
+    let events = run_to_end(&harness, request("styled"), ansi_controls).await;
+    assert!(
+        matches!(events.first(), Some(AgentEvent::SessionStarted { session_id, .. }) if session_id == "ses-ansi"),
+        "{events:?}"
+    );
+    assert_no_leakage(&events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "finished"))
+    );
+    assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Completed, session_id: Some(id), .. } if id == "ses-ansi")));
 
     set_env("ASIDE_FAKE_SCENARIO", "resume");
     let mut follow_up = request("continue");
@@ -208,19 +246,21 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
             .iter()
             .any(|event| matches!(event, AgentEvent::TextDelta { text } if text == "follow-up complete"))
     );
-    for event in &events {
-        match event {
-            AgentEvent::TextDelta { text } => {
-                assert!(!text.contains("session_id:"), "{text}")
-            }
-            AgentEvent::Done {
-                result: Some(result),
-                ..
-            } => assert!(!result.contains("session_id:"), "{result}"),
-            _ => {}
-        }
-    }
+    assert_no_leakage(&events);
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Completed, session_id: Some(id), .. } if id == "ses-resumed")));
+
+    // Non-zero exit is a loud terminal error: no SessionStarted (no id was
+    // parsed and none was resumed), Done::Errored carrying the stderr tail.
+    set_env("ASIDE_FAKE_SCENARIO", "error");
+    let (error_controls, _steer, _interrupt) = make_controls();
+    let events = run_to_end(&harness, request("fail"), error_controls).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+    assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Errored, error: Some(error), session_id: None, .. } if error == "agent failed")));
 
     set_env("ASIDE_FAKE_SCENARIO", "hold");
     let mut live = request("keep working");
@@ -254,16 +294,36 @@ async fn fake_cli_covers_detection_arguments_result_error_resume_steer_and_inter
     assert!(events.iter().any(|event| matches!(event, AgentEvent::Done { status: DoneStatus::Interrupted, session_id: Some(id), .. } if id == "ses-live")));
 
     let calls = std::fs::read_to_string(log).unwrap();
+    let lines: Vec<&str> = calls.lines().collect();
     // Stored reasoning is ignored: no --effort flag from it (the `effort`
-    // option is the single knob).
+    // option is the single knob). Routing flags ride the FIRST-turn `exec`
+    // argv for real (native transport, not mcp).
     assert!(
-        calls.contains(
-            "--speed fast --permission full-access --provider openai --host local mcp"
-        ),
+        lines.iter().any(|line| line.contains(
+            "--speed fast --permission full-access --provider openai --host local exec"
+        )),
         "{calls}"
     );
-    assert!(calls.contains("--speed fast mcp"), "{calls}");
-    assert!(calls.contains(r#"session_id":"ses-happy"#), "{calls}");
+    // Slash-model routing lands on the exec argv as `-m provider/model`.
+    let slash_exec = lines
+        .iter()
+        .find(|line| line.contains("-m openai-codex/fake-codex-model-1"))
+        .expect("slash exec argv carries -m");
+    assert!(slash_exec.contains(" exec "), "{slash_exec}");
+    // The resume turn goes through `session resume <id>` with NO model
+    // flags: the session keeps its original model.
+    let resume_line = lines
+        .iter()
+        .find(|line| line.contains("session resume ses-happy"))
+        .expect("resume argv uses session resume");
+    assert!(!resume_line.contains(" -m "), "{resume_line}");
+    assert!(!resume_line.contains("--effort"), "{resume_line}");
+    assert!(!resume_line.contains("--speed"), "{resume_line}");
+    assert!(!resume_line.contains(" exec "), "{resume_line}");
+    // The MCP server is no longer used: no mcp argv, no JSON-RPC leakage.
+    assert!(!calls.contains(" mcp"), "{calls}");
+    assert!(!calls.contains(r#""method":"#), "{calls}");
+    assert!(!calls.contains(r#"session_id":"#), "{calls}");
     assert!(
         calls.contains("session steer ses-live change direction"),
         "{calls}"

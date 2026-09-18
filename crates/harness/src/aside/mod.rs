@@ -1,14 +1,22 @@
 //! Aside Browser CLI harness.
 //!
-//! This adapter uses only the public `aside` CLI surface:
-//! - `aside mcp` over newline-delimited MCP JSON-RPC for execution/resume;
+//! This adapter uses only the public `aside` CLI surface with the native CLI
+//! transport (no MCP server):
+//! - `aside <routing flags> exec <prompt>` for the first turn — model routing
+//!   (`-m`/`--speed`/`--effort`/`--permission`/`--provider`/`--host`/
+//!   `--account`) is real here, applied at session creation;
+//! - `aside [--account] session resume <id> <prompt>` for follow-ups — resume
+//!   accepts only `--account`; the session keeps its original model;
 //! - `aside session steer` for an in-flight replacement prompt; and
 //! - `aside session stop` for interruption.
 //!
-//! The MCP `exec` tool is completion-oriented rather than a token stream, so a
-//! completed response is normalized into one text delta (when present) and a
-//! terminal `Done` event. Session ids are carried through both the start and
-//! terminal events and are passed back to `exec` for follow-up turns.
+//! `exec`/`resume` run to completion rather than streaming tokens, so a
+//! completed reply is normalized into one text delta (when present) and a
+//! terminal `Done` event. Stdout is the reply text; stderr carries
+//! `created new session: <id>` / `continuing existing session: <id>`
+//! (possibly ANSI-wrapped). Session ids are carried through both the start
+//! and terminal events and are passed back to `session resume` for
+//! follow-ups.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,8 +24,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use serde_json::{Map, Value, json};
-use tokio::io::AsyncBufReadExt;
+use serde_json::Value;
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -25,11 +33,9 @@ use zeron_proto::{
     RunRequest, SteeringMode,
 };
 
-use crate::jsonrpc::RpcClient;
 use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, shutdown_child};
 
-const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
 const DEFAULT_MODEL: &str = "default";
 const FAST_MODEL: &str = "fast";
 const INTERRUPT_GRACE: Duration = Duration::from_secs(2);
@@ -701,51 +707,26 @@ impl AsideHarness {
         }
     }
 
-    async fn spawn_mcp(
-        &self,
-        request: &RunRequest,
-    ) -> Result<(PathBuf, Child, RpcClient), HarnessError> {
-        let executable = self.resolve_executable()?;
-        let mut command = Command::new(&executable);
-        command.args(self.resolved_global_args(request).await).arg("mcp");
-        crate::compose_child_path(&mut command, &executable);
-        if !request.cwd.is_empty() {
-            command.current_dir(&request.cwd);
+    /// Spawn `aside` for a run-to-completion turn with piped stdout/stderr.
+    fn spawn_turn(executable: &Path, args: &[String], cwd: &str) -> Result<Child, HarnessError> {
+        let mut command = Command::new(executable);
+        command.args(args);
+        crate::compose_child_path(&mut command, executable);
+        if !cwd.is_empty() {
+            command.current_dir(cwd);
         }
         command
-            .stdin(Stdio::piped())
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
+        command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(executable.display().to_string())
             } else {
                 HarnessError::Io(error)
             }
-        })?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("aside mcp child has no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| HarnessError::Protocol("aside mcp child has no stdout".into()))?;
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let mut lines = tokio::io::BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::aside", "aside stderr: {line}");
-                }
-            });
-        }
-        let (client, mut incoming) = RpcClient::new(stdin, stdout);
-        // MCP servers may emit startup notifications/events. Keep the reader
-        // alive and discard those non-request messages; JSON-RPC responses are
-        // still resolved by RpcClient's pending map.
-        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-        Ok((executable, child, client))
+        })
     }
 
     async fn run_session_command(
@@ -810,7 +791,7 @@ impl Harness for AsideHarness {
         self.resolve_executable().is_ok()
     }
 
-    // MCP exec returns only after the CLI has completed the task.
+    // Native `exec`/`resume` runs to completion (no token stream).
     fn deterministic_turn_end(&self) -> bool {
         true
     }
@@ -836,17 +817,44 @@ impl Harness for AsideHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let (executable, child, client) = self.spawn_mcp(&request).await?;
+        let executable = self.resolve_executable()?;
+        let global_args = self.resolved_global_args(&request).await;
+        // First turn routes the model for real at session creation; follow-up
+        // turns resume the existing session (model flags would be rejected —
+        // the session keeps its original model, so only `--account` rides
+        // along). The prompt is always a single argv element.
+        let argv: Vec<String> = match request.resume.clone() {
+            Some(session_id) => {
+                let mut argv = resume_account_args(&global_args);
+                argv.extend([
+                    "session".to_owned(),
+                    "resume".to_owned(),
+                    session_id,
+                    request.prompt.clone(),
+                ]);
+                argv
+            }
+            None => {
+                let mut argv = global_args;
+                argv.extend(["exec".to_owned(), request.prompt.clone()]);
+                argv
+            }
+        };
+        let child = Self::spawn_turn(&executable, &argv, &request.cwd)?;
         let (event_tx, event_rx) = mpsc::channel(32);
+        // Aside's CLI does not provide a message id in its stdout/stderr
+        // contract; mint one per Zeron turn so separate chats and follow-ups
+        // cannot collide in the engine's transcript deduplication.
+        let assistant_message_id = format!("aside-{}", uuid::Uuid::new_v4());
         tokio::spawn(run_session(AsideSession {
             executable,
             child,
-            client,
             event_tx,
             request,
             controls,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            assistant_message_id,
         }));
         Ok(futures::stream::unfold(
             event_rx,
@@ -859,24 +867,100 @@ impl Harness for AsideHarness {
 struct AsideSession {
     executable: PathBuf,
     child: Child,
-    client: RpcClient,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request: RunRequest,
     controls: RunControls,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    assistant_message_id: String,
+}
+
+/// Strip SGR ANSI escapes (`\x1b\[[0-9;]*m`) from captured CLI output.
+fn strip_ansi(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'm' {
+                i = j + 1;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap_or('\u{FFFD}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Parse the session id from ANSI-stripped stderr.
+///
+/// Matches lines containing `created new session: <id>` or
+/// `continuing existing session: <id>` (regex-free substring search; the id
+/// is the first non-whitespace run after the marker). The LAST such match
+/// wins when several are present. Returns `None` when no line carries an id.
+fn parse_cli_session_id(stderr_text: &str) -> Option<String> {
+    let mut found = None;
+    for line in stderr_text.lines() {
+        for needle in ["created new session:", "continuing existing session:"] {
+            if let Some(pos) = line.find(needle) {
+                let id = line[pos + needle.len()..]
+                    .trim_start()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if !id.is_empty() {
+                    found = Some(id.to_owned());
+                }
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Keep only `--account <id>` from resolved global args for `session resume`,
+/// which accepts no model/effort flags (the session keeps its original
+/// model).
+fn resume_account_args(global_args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < global_args.len() {
+        if global_args[i] == "--account" && i + 1 < global_args.len() {
+            out.extend(["--account".to_owned(), global_args[i + 1].clone()]);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Cap an error message at ~500 chars (char-boundary safe), keeping the tail.
+fn cap_error_tail(message: &str) -> String {
+    const CAP: usize = 500;
+    let count = message.chars().count();
+    if count <= CAP {
+        return message.to_owned();
+    }
+    message.chars().skip(count - CAP).collect()
 }
 
 async fn run_session(session: AsideSession) {
     let AsideSession {
         executable,
         mut child,
-        client,
         event_tx,
         request,
         controls,
         interrupt_grace,
         kill_grace,
+        assistant_message_id,
     } = session;
     let RunControls {
         request_input: _,
@@ -884,67 +968,66 @@ async fn run_session(session: AsideSession) {
         interrupt,
     } = controls;
 
-    let initialize = client.request(
-        "initialize",
-        json!({
-            "protocolVersion": DEFAULT_PROTOCOL_VERSION,
-            "capabilities": {},
-            "clientInfo": {
-                "name": "zeron-aside",
-                "title": "Zeron",
-                "version": env!("CARGO_PKG_VERSION"),
-            }
-        }),
-    );
-    if let Err(error) = tokio::select! {
-        result = initialize => result,
-        _ = interrupt.cancelled() => {
-            emit_done(&event_tx, DoneStatus::Interrupted, None, None, request.resume.clone()).await;
+    // The resumed session id doubles as the in-flight steer/stop target and
+    // the fallback id when fresh stderr carries no session line. First turns
+    // have no id until the child exits, so they cannot be steered mid-flight.
+    let resume_session_id = request.resume.clone();
+    let mut interrupted = false;
+    let mut control_tasks = Vec::new();
+
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            emit_done(
+                &event_tx,
+                DoneStatus::Errored,
+                None,
+                Some("aside child has no stdout".into()),
+                resume_session_id,
+            )
+            .await;
             shutdown_child(&mut child, kill_grace).await;
             return;
         }
-    } {
-        emit_done(
-            &event_tx,
-            DoneStatus::Errored,
-            None,
-            Some(error.to_string()),
-            None,
-        )
-        .await;
-        shutdown_child(&mut child, kill_grace).await;
-        return;
-    }
-    client.notify("notifications/initialized", None);
+    };
+    let mut stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            emit_done(
+                &event_tx,
+                DoneStatus::Errored,
+                None,
+                Some("aside child has no stderr".into()),
+                resume_session_id,
+            )
+            .await;
+            shutdown_child(&mut child, kill_grace).await;
+            return;
+        }
+    };
+    // Drain both pipes to completion alongside the exit wait so large replies
+    // cannot deadlock on a full pipe buffer.
+    let mut stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = AsyncReadExt::read_to_end(&mut stdout, &mut buf).await;
+        buf
+    });
+    let mut stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let _ = AsyncReadExt::read_to_end(&mut stderr, &mut buf).await;
+        buf
+    });
 
-    let mut arguments = Map::new();
-    arguments.insert("prompt".into(), Value::String(request.prompt.clone()));
-    if let Some(session_id) = request.resume.as_deref() {
-        arguments.insert("session_id".into(), Value::String(session_id.into()));
-    }
-    let mut call = Box::pin(client.request(
-        "tools/call",
-        Value::Object(Map::from_iter([
-            ("name".into(), Value::String("exec".into())),
-            ("arguments".into(), Value::Object(arguments)),
-        ])),
-    ));
-    let mut interrupted = false;
-    let interrupted_session_id = request.resume.clone();
-    // Aside MCP does not provide a message id in its public result contract;
-    // mint one per Zeron turn so separate chats and follow-ups cannot collide
-    // in the engine's transcript deduplication.
-    let assistant_message_id = format!("aside-{}", uuid::Uuid::new_v4());
-    let mut control_tasks = Vec::new();
+    let mut wait = Box::pin(child.wait());
 
-    let response = loop {
+    let output = loop {
         tokio::select! {
-            result = &mut call => break Some(result),
+            result = &mut wait => break Some(result),
             message = steering.recv(), if !interrupted => {
                 let Some(message) = message else { continue };
-                let Some(session_id) = interrupted_session_id.clone() else {
+                let Some(session_id) = resume_session_id.clone() else {
                     let _ = event_tx.send(Ok(AgentEvent::Error {
-                        message: "Aside cannot steer a new MCP session until its session_id is known".into(),
+                        message: "Aside cannot steer a new session until its session_id is known".into(),
                     })).await;
                     continue;
                 };
@@ -967,7 +1050,7 @@ async fn run_session(session: AsideSession) {
             },
             _ = interrupt.cancelled(), if !interrupted => {
                 interrupted = true;
-                if let Some(session_id) = interrupted_session_id.clone() {
+                if let Some(session_id) = resume_session_id.clone() {
                     let harness = AsideHarness::new()
                         .with_executable(executable.clone())
                         .with_graces(interrupt_grace, kill_grace);
@@ -976,7 +1059,7 @@ async fn run_session(session: AsideSession) {
                         let _ = harness.run_session_command(&request_clone, "stop", &session_id, None).await;
                     }));
                 }
-                match tokio::time::timeout(interrupt_grace, &mut call).await {
+                match tokio::time::timeout(interrupt_grace, &mut wait).await {
                     Ok(result) => break Some(result),
                     Err(_) => break None,
                 }
@@ -987,24 +1070,85 @@ async fn run_session(session: AsideSession) {
     for task in control_tasks {
         let _ = tokio::time::timeout(interrupt_grace, task).await;
     }
+    // Release the `child.wait()` borrow before any `shutdown_child` call.
+    drop(wait);
 
     if interrupted {
+        stdout_task.abort();
+        stderr_task.abort();
         emit_done(
             &event_tx,
             DoneStatus::Interrupted,
             None,
             None,
-            interrupted_session_id,
+            resume_session_id,
         )
         .await;
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
 
-    match response {
-        Some(Ok(result)) => {
-            let mapped = map_completed_result(&result, request.resume.as_deref());
-            let Some(session_id) = mapped.session_id.clone() else {
+    match output {
+        Some(Ok(status)) => {
+            // The child has exited; the pipe drains finish on EOF shortly
+            // after. Bound the join so a stuck reader cannot hang the turn.
+            let stdout_bytes = match tokio::time::timeout(interrupt_grace, &mut stdout_task).await
+            {
+                Ok(Ok(bytes)) => bytes,
+                _ => {
+                    stdout_task.abort();
+                    Vec::new()
+                }
+            };
+            let stderr_bytes = match tokio::time::timeout(interrupt_grace, &mut stderr_task).await
+            {
+                Ok(Ok(bytes)) => bytes,
+                _ => {
+                    stderr_task.abort();
+                    Vec::new()
+                }
+            };
+            let stdout_text = strip_ansi(&String::from_utf8_lossy(&stdout_bytes));
+            let stderr_text = strip_ansi(&String::from_utf8_lossy(&stderr_bytes));
+            // Visible text is the full ANSI-stripped stdout, trailing
+            // whitespace trimmed, body otherwise exact. Session lines live on
+            // stderr, so they never leak into chat text or the result.
+            let visible = stdout_text.trim_end().to_owned();
+            let parsed_id = parse_cli_session_id(&stderr_text);
+            if !status.success() {
+                let raw = stderr_text.trim();
+                let error = if raw.is_empty() {
+                    format!(
+                        "aside exited unsuccessfully ({})",
+                        crate::describe_exit(Some(status))
+                    )
+                } else {
+                    cap_error_tail(raw)
+                };
+                let session_id = parsed_id.or(resume_session_id);
+                // Mirror the success path: when an id is known even on
+                // failure, SessionStarted still comes first so the engine
+                // records the resume id.
+                if let Some(session_id) = session_id.clone() {
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::SessionStarted {
+                            harness: HarnessId::Aside,
+                            model: request
+                                .model
+                                .clone()
+                                .unwrap_or_else(|| DEFAULT_MODEL.into()),
+                            tools: Vec::new(),
+                            cwd: request.cwd.clone(),
+                            session_id: session_id.clone(),
+                            assistant_message_id: assistant_message_id.clone(),
+                        }))
+                        .await;
+                }
+                emit_done(&event_tx, DoneStatus::Errored, None, Some(error), session_id).await;
+                shutdown_child(&mut child, kill_grace).await;
+                return;
+            }
+            let Some(session_id) = parsed_id.or(resume_session_id) else {
                 // Loud failure, never a silent new session: without an id the
                 // engine could record no resume and every follow-up would
                 // start over. No ids are ever synthesized or stored here.
@@ -1012,7 +1156,10 @@ async fn run_session(session: AsideSession) {
                     &event_tx,
                     DoneStatus::Errored,
                     None,
-                    mapped.error,
+                    Some(
+                        "Aside response had no session id (expected `created new session: <id>` or `continuing existing session: <id>` in stderr)"
+                            .into(),
+                    ),
                     None,
                 )
                 .await;
@@ -1037,10 +1184,10 @@ async fn run_session(session: AsideSession) {
                     assistant_message_id: assistant_message_id.clone(),
                 }))
                 .await;
-            if mapped.status == DoneStatus::Completed && !mapped.visible.is_empty() {
+            if !visible.is_empty() {
                 let _ = event_tx
                     .send(Ok(AgentEvent::TextDelta {
-                        text: mapped.visible.clone(),
+                        text: visible.clone(),
                     }))
                     .await;
                 let _ = event_tx
@@ -1051,140 +1198,39 @@ async fn run_session(session: AsideSession) {
             }
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
-                    status: mapped.status,
-                    result: mapped.result,
-                    error: mapped.error,
+                    status: DoneStatus::Completed,
+                    result: (!visible.is_empty()).then(|| visible.clone()),
+                    error: None,
                     session_id: Some(session_id),
                 }))
                 .await;
         }
         Some(Err(error)) => {
+            stdout_task.abort();
+            stderr_task.abort();
             emit_done(
                 &event_tx,
                 DoneStatus::Errored,
                 None,
                 Some(error.to_string()),
-                interrupted_session_id,
+                resume_session_id,
             )
             .await;
         }
         None => {
+            stdout_task.abort();
+            stderr_task.abort();
             emit_done(
                 &event_tx,
                 DoneStatus::Errored,
                 None,
-                Some("Aside MCP session ended without a result".into()),
-                interrupted_session_id,
+                Some("Aside session ended without a result".into()),
+                resume_session_id,
             )
             .await;
         }
     }
     shutdown_child(&mut child, kill_grace).await;
-}
-
-struct MappedResult {
-    status: DoneStatus,
-    /// Visible reply body with the `session_id` line stripped (or the whole
-    /// wire text when no session line was present). May be empty.
-    visible: String,
-    /// Short completed text for the terminal event (never a dump). `None`
-    /// when there is nothing visible or the turn errored.
-    result: Option<String>,
-    error: Option<String>,
-    session_id: Option<String>,
-}
-
-/// Map a completed `exec` result.
-///
-/// Wire shape (only shape): `{"result":{"content":[{"type":"text",
-/// `"text":"session_id: <id>\n\n<reply>"}],"isError":false}}`. The session
-/// id is EMBEDDED as the text's first line — there is no separate structured
-/// session-id field — so it is parsed exactly, never sniffed. `isError` is
-/// the only error signal; `structuredContent` and any `events` arrays are
-/// fiction and are not read.
-fn map_completed_result(response: &Value, fallback_session_id: Option<&str>) -> MappedResult {
-    let raw = wire_text(response).unwrap_or("");
-    let (parsed_id, visible) = match parse_session_reply(raw) {
-        Some((id, body)) => (Some(id), body),
-        // Unparseable text carries no session line, so the whole text is the
-        // visible body; the id falls back to the resumed session when one
-        // exists. Ids are never synthesized.
-        None => (None, raw.to_owned()),
-    };
-    let session_id = parsed_id.or_else(|| fallback_session_id.map(str::to_owned));
-    if is_tool_error(response) {
-        let error = if visible.trim().is_empty() {
-            "Aside MCP execution failed".to_owned()
-        } else {
-            visible.clone()
-        };
-        return MappedResult {
-            status: DoneStatus::Errored,
-            visible,
-            result: None,
-            error: Some(error),
-            session_id,
-        };
-    }
-    let Some(session_id) = session_id else {
-        return MappedResult {
-            status: DoneStatus::Errored,
-            visible,
-            result: None,
-            error: Some(
-                "Aside MCP response had no session id (expected first line `session_id: <id>`)".into(),
-            ),
-            session_id: None,
-        };
-    };
-    MappedResult {
-        result: (!visible.is_empty()).then(|| visible.clone()),
-        status: DoneStatus::Completed,
-        visible,
-        error: None,
-        session_id: Some(session_id),
-    }
-}
-
-/// Parse `session_id: <id>\n\n<body>`.
-///
-/// The first line must be exactly `session_id:` plus a single non-space id
-/// (a trailing `\r` is tolerated). The body is everything after exactly one
-/// blank-line separator, preserved byte-identically except for trimmed
-/// trailing whitespace. Returns `None` when the first line is not a session
-/// line.
-fn parse_session_reply(text: &str) -> Option<(String, String)> {
-    let (first, rest) = match text.split_once('\n') {
-        Some((first, rest)) => (first, rest),
-        None => (text, ""),
-    };
-    let first = first.strip_suffix('\r').unwrap_or(first);
-    let id = first.strip_prefix("session_id:")?.trim();
-    if id.is_empty() || id.chars().any(char::is_whitespace) {
-        return None;
-    }
-    // `rest` starts right after the first line's newline; strip exactly one
-    // blank-line separator so further leading blank lines that belong to the
-    // reply body survive.
-    let body = rest
-        .strip_prefix("\r\n")
-        .or_else(|| rest.strip_prefix('\n'))
-        .or_else(|| rest.strip_prefix('\r'))
-        .unwrap_or(rest);
-    Some((id.to_owned(), body.trim_end().to_owned()))
-}
-
-/// The explicit wire text: the first `content[]` text item.
-fn wire_text(response: &Value) -> Option<&str> {
-    response
-        .get("content")?
-        .as_array()?
-        .iter()
-        .find_map(|item| item.get("text")?.as_str())
-}
-
-fn is_tool_error(response: &Value) -> bool {
-    response.get("isError").and_then(Value::as_bool) == Some(true)
 }
 
 fn option_string(value: &Value) -> Option<&str> {
@@ -1215,6 +1261,7 @@ async fn emit_done(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Map, json};
     use std::collections::HashMap;
     use std::ffi::OsString;
 
@@ -1289,98 +1336,92 @@ mod tests {
     }
 
     #[test]
-    fn parses_embedded_session_id_and_strips_it_from_visible_text() {
-        let mapped = map_completed_result(
-            &json!({
-                "content": [{"type": "text", "text": "session_id: ses-1\n\nfinished"}],
-                "isError": false,
-            }),
-            None,
+    fn strip_ansi_removes_sgr_sequences() {
+        assert_eq!(
+            strip_ansi("\x1b[2mcreated new session: ses-1\x1b[0m"),
+            "created new session: ses-1"
         );
-        assert_eq!(mapped.session_id.as_deref(), Some("ses-1"));
-        assert_eq!(mapped.status, DoneStatus::Completed);
-        assert_eq!(mapped.visible, "finished");
-        assert_eq!(mapped.result.as_deref(), Some("finished"));
-        assert_eq!(mapped.error, None);
+        assert_eq!(strip_ansi("\x1b[32mfinished\x1b[0m"), "finished");
+        assert_eq!(strip_ansi("\x1b[1;32mok\x1b[0m!"), "ok!");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi(""), "");
     }
 
     #[test]
-    fn session_reply_parsing_preserves_body_bytes() {
-        // Exactly one blank-line separator is stripped; further leading blank
-        // lines and interior bytes survive, trailing whitespace is trimmed.
+    fn cli_session_id_matches_both_verbs_and_takes_last_match() {
         assert_eq!(
-            parse_session_reply("session_id: ses-1\n\nline one\n\nline two  \n"),
-            Some(("ses-1".into(), "line one\n\nline two".into()))
+            parse_cli_session_id("created new session: ses-1\n"),
+            Some("ses-1".into())
         );
         assert_eq!(
-            parse_session_reply("session_id: ses-1\r\n\r\nbody\r\n"),
-            Some(("ses-1".into(), "body".into()))
+            parse_cli_session_id("continuing existing session: ses-2\n"),
+            Some("ses-2".into())
+        );
+        // Extra surrounding log lines are fine; the LAST match wins.
+        assert_eq!(
+            parse_cli_session_id("starting up\ncreated new session: ses-1\ncreated new session: ses-2\n"),
+            Some("ses-2".into())
+        );
+        // ANSI must be stripped BEFORE matching (callers strip first).
+        assert_eq!(
+            parse_cli_session_id(&strip_ansi(
+                "\x1b[2mcreated new session: ses-ansi\x1b[0m\n"
+            )),
+            Some("ses-ansi".into())
         );
         assert_eq!(
-            parse_session_reply("session_id: ses-1\n\n\nkept blank"),
-            Some(("ses-1".into(), "\nkept blank".into()))
+            parse_cli_session_id(&strip_ansi(
+                "\x1b[2mcontinuing existing session: ses-ansi\x1b[0m\n"
+            )),
+            Some("ses-ansi".into())
         );
-        // No session line, empty id, or spaced id: unparseable, never guessed.
-        assert_eq!(parse_session_reply("just a reply"), None);
-        assert_eq!(parse_session_reply("session_id: \n\nbody"), None);
-        assert_eq!(parse_session_reply("session_id: two words\n\nbody"), None);
-        assert_eq!(parse_session_reply(""), None);
+        // No marker, empty id, or blank input: unparseable, never guessed.
+        assert_eq!(parse_cli_session_id("just a reply\n"), None);
+        assert_eq!(parse_cli_session_id("created new session: \n"), None);
+        assert_eq!(parse_cli_session_id(""), None);
     }
 
     #[test]
-    fn unparseable_text_falls_back_to_resume_id_but_never_invents_one() {
-        let mapped = map_completed_result(
-            &json!({
-                "content": [{"type": "text", "text": "plain reply, no session line"}],
-                "isError": false,
-            }),
-            Some("ses-2"),
-        );
-        assert_eq!(mapped.session_id.as_deref(), Some("ses-2"));
-        assert_eq!(mapped.status, DoneStatus::Completed);
-        assert_eq!(mapped.visible, "plain reply, no session line");
+    fn resume_args_keep_only_account() {
+        let global = vec![
+            "-m".to_owned(),
+            "fake-provider/fake-model".to_owned(),
+            "--effort".to_owned(),
+            "high".to_owned(),
+            "--permission".to_owned(),
+            "guard".to_owned(),
+            "--provider".to_owned(),
+            "fake-provider".to_owned(),
+            "--host".to_owned(),
+            "local".to_owned(),
+            "--account".to_owned(),
+            "u0".to_owned(),
+        ];
+        // Model/effort/permission/provider/host never ride `session resume`;
+        // the session keeps its original model.
         assert_eq!(
-            mapped.result.as_deref(),
-            Some("plain reply, no session line")
+            resume_account_args(&global),
+            vec!["--account".to_owned(), "u0".to_owned()]
         );
+        let bare: Vec<String> = vec!["--speed".to_owned(), "fast".to_owned()];
+        assert!(resume_account_args(&bare).is_empty());
     }
 
     #[test]
-    fn missing_id_without_resume_errors_loudly() {
-        let mapped = map_completed_result(
-            &json!({
-                "content": [{"type": "text", "text": "plain reply, no session line"}],
-                "isError": false,
-            }),
-            None,
-        );
-        assert_eq!(mapped.status, DoneStatus::Errored);
-        assert_eq!(mapped.session_id, None);
-        assert!(
-            mapped
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("no session id")),
-            "{:?}",
-            mapped.error
-        );
+    fn error_tail_caps_at_500_chars() {
+        let long = "x".repeat(2000);
+        let capped = cap_error_tail(&long);
+        assert_eq!(capped.chars().count(), 500);
+        assert!(long.ends_with(&capped));
+        assert_eq!(cap_error_tail("short"), "short");
     }
 
     #[test]
-    fn maps_mcp_tool_error() {
-        let mapped = map_completed_result(
-            &json!({
-                "isError": true,
-                "content": [{"type": "text", "text": "session_id: ses-2\n\nnot running"}]
-            }),
-            Some("ses-resume"),
-        );
-        assert_eq!(mapped.status, DoneStatus::Errored);
-        // The parsed id wins over the resume fallback, and the session line
-        // never leaks into the error text.
-        assert_eq!(mapped.session_id.as_deref(), Some("ses-2"));
-        assert_eq!(mapped.error.as_deref(), Some("not running"));
-        assert_eq!(mapped.result, None);
+    fn visible_text_trims_only_trailing_whitespace() {
+        // Body bytes otherwise exact: leading blank lines survive, trailing
+        // whitespace (incl. newlines) is trimmed.
+        let stripped = strip_ansi("\x1b[32mfinished\x1b[0m  \n");
+        assert_eq!(stripped.trim_end(), "finished");
     }
 
     #[test]

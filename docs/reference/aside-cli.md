@@ -56,14 +56,18 @@ or credential storage.
 
 ## Transport and lifecycle
 
-Zeron starts the public `aside mcp` command and speaks newline-delimited MCP
-JSON-RPC over stdin/stdout. It does not use private app, daemon, or browser
-protocols.
+Zeron spawns the public `aside` CLI directly for each turn (native CLI
+transport — the MCP server is no longer used). It does not use private app,
+daemon, or browser protocols.
 
 The adapter supports:
 
-- start a task through the MCP `exec` tool;
-- resume by passing the existing Aside `session_id` to `exec`;
+- start a task with `aside <routing flags> exec <prompt>` (first turn);
+  model routing (`-m`/`--speed`/`--effort`/`--permission`/`--provider`/
+  `--host`/`--account`) is real here, applied at session creation;
+- resume with `aside [--account] session resume <session-id> <prompt>`;
+  resume accepts only `--account` — the session keeps its original model,
+  so no model/effort flags are sent;
 - steer with `aside session steer <session-id> <prompt>`; the documented command interrupts the current step and replaces it.
 - stop with `aside session stop <session-id>`;
 - `default` and `fast` routing;
@@ -74,22 +78,24 @@ Aside's CLI also exposes queue, archive, delete, account, host, and update
 commands. Queue, archive, and delete remain CLI-only in this adapter unless a
 future wire integration gives them durable Zeron lifecycle semantics.
 
-Aside MCP is completion-oriented. It returns the completed tool result rather
-than a stable stream of intermediate agent or tool events. Zeron therefore
-emits the completed text result and terminal status only; it does not promise
-streaming tool events, token deltas, or live progress from Aside.
+Aside's CLI runs each turn to completion. It returns the completed reply
+rather than a stable stream of intermediate agent or tool events. Zeron
+therefore emits the completed text result and terminal status only; it does
+not promise streaming tool events, token deltas, or live progress from Aside.
 
-The public result also provides the session id only when the call completes.
+Stdout is the reply text only. The session id arrives on stderr as
+`created new session: <id>` (first turn) or
+`continuing existing session: <id>` (resume), possibly wrapped in ANSI
+escapes alongside other log lines. Zeron strips ANSI escapes, parses the
+LAST such line, emits `SessionStarted` first so the engine records the
+resume id, and reports a loud error (never a silent new session) when
+neither a parsed id nor a resumed session exists. A non-zero exit is a loud
+terminal error carrying the stderr tail.
+
+The session id is only known once the turn's child process exits.
 Consequently, in-turn steering is available for a resumed or previously
-persisted Aside session; the first-ever turn cannot be steered through this
-transport and reports that limitation instead of guessing a session.
-
-The id arrives embedded as the first line of the exec result text
-(`session_id: <id>`, blank line, reply body) — there is no separate
-structured session-id field. Zeron parses that line exactly, strips it from
-the visible reply, emits `SessionStarted` first so the engine records the
-resume id, and reports a loud error (never a silent new session) when neither
-a parsed id nor a resumed session exists.
+persisted Aside session; the first-ever turn cannot be steered mid-flight
+and reports that limitation instead of guessing a session.
 
 ## Models and options
 
@@ -137,8 +143,10 @@ never a hard error. When discovery fails, the value forwards unvalidated
 rather than breaking the run.
 
 Model routing for discovered rows: when `request.model` contains `/`, the
-spawn passes `-m <provider/model>` (slash form overrides `--provider`, so
-`-p` is not also sent). `default`/`fast`/other behavior is unchanged
+first-turn spawn passes `-m <provider/model>` (slash form overrides
+`--provider`, so `-p` is not also sent). Resume turns never send `-m`
+(or `--effort`/`--speed`): the session keeps its original model.
+`default`/`fast`/other behavior is unchanged
 (`--speed fast`, `--model <id>`, `--effort`, `--permission`, `--provider`,
 `--host`, `--account`).
 
@@ -187,7 +195,8 @@ or validate remote host names.
 ## Source boundaries
 
 - [Aside developer tools](https://docs.aside.com/help/developers) documents
-  CLI installation, `exec`, MCP, accounts, host selection, and REPL usage.
+  CLI installation, `exec`, session resume, accounts, host selection, and
+  REPL usage.
 - [Aside AI providers](https://docs.aside.com/help/ai) documents built-in,
   subscription, and API-key provider categories.
 - The live CLI's `aside exec --help` is authoritative for the installed
